@@ -3,6 +3,8 @@ mod api;
 #[allow(dead_code)]
 mod config;
 #[allow(dead_code)]
+mod engine;
+#[allow(dead_code)]
 mod error;
 
 fn main() {
