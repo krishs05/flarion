@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "A Rust-native LLM inference gateway"
-repository = "https://github.com/KrishBaidya/flarion"
+repository = "https://github.com/krishs05/flarion"
 
 [dependencies]
 axum = "0.8"
