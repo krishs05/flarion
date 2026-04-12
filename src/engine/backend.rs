@@ -1,6 +1,7 @@
 use crate::api::types::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse};
 use crate::error::EngineError;
 
+#[allow(dead_code)]
 pub struct ModelInfo {
     pub id: String,
     pub context_size: u32,

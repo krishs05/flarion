@@ -6,6 +6,7 @@ mod server;
 
 use clap::Parser;
 use config::{Cli, FlarionConfig};
+use engine::backend::InferenceBackend;
 use engine::llama::LlamaBackend;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;

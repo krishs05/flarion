@@ -6,6 +6,7 @@ use serde_json::json;
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("model not found: {0}")]
+    #[allow(dead_code)]
     ModelNotFound(String),
     #[error("failed to load model: {0}")]
     ModelLoadFailed(String),
