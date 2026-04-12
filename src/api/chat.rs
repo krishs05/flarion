@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-use crate::api::types::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse};
+use crate::api::types::{ChatCompletionChunk, ChatCompletionRequest};
 use crate::engine::backend::InferenceBackend;
 use crate::error::ApiError;
 

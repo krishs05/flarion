@@ -1,3 +1,4 @@
+use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::Router;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ pub fn create_router(backend: Arc<dyn InferenceBackend>) -> Router {
             post(crate::api::chat::chat_completions),
         )
         .layer(TraceLayer::new_for_http())
-        .layer(TimeoutLayer::new(Duration::from_secs(300)))
+        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, Duration::from_secs(300)))
         .layer(CorsLayer::permissive())
         .with_state(backend)
 }
