@@ -1,0 +1,15 @@
+[server]
+host = "0.0.0.0"
+port = 8080
+
+[model]
+id = "my-model"
+path = "/path/to/your/model.gguf"
+context_size = 4096
+gpu_layers = 99
+# threads = 8
+# batch_size = 512
+# seed = 42
+
+[logging]
+level = "info"
