@@ -3,7 +3,11 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "flarion", version, about = "A Rust-native LLM inference gateway")]
+#[command(
+    name = "flarion",
+    version,
+    about = "A Rust-native LLM inference gateway"
+)]
 pub struct Cli {
     /// Path to the configuration file
     #[arg(short, long, default_value = "flarion.toml")]
@@ -65,11 +69,21 @@ impl Default for LoggingConfig {
     }
 }
 
-fn default_host() -> String { "0.0.0.0".to_string() }
-fn default_port() -> u16 { 8080 }
-fn default_context_size() -> u32 { 4096 }
-fn default_gpu_layers() -> u32 { 99 }
-fn default_log_level() -> String { "info".to_string() }
+fn default_host() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_port() -> u16 {
+    8080
+}
+fn default_context_size() -> u32 {
+    4096
+}
+fn default_gpu_layers() -> u32 {
+    99
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
 
 impl FlarionConfig {
     pub fn load(path: &std::path::Path) -> Result<Self, ConfigError> {

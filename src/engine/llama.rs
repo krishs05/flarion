@@ -11,7 +11,7 @@ use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel
 use llama_cpp_2::sampling::LlamaSampler;
 
 use crate::api::types::{
-    ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionChoice, ChatCompletionRequest,
+    ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionRequest,
     ChatCompletionResponse, ChatDelta, ChatMessage, Usage,
 };
 use crate::config::ModelConfig;
@@ -131,14 +131,11 @@ impl crate::engine::backend::InferenceBackend for LlamaBackend {
         })?;
 
         // Configure model params
-        let model_params =
-            LlamaModelParams::default().with_n_gpu_layers(self.config.gpu_layers);
+        let model_params = LlamaModelParams::default().with_n_gpu_layers(self.config.gpu_layers);
 
         // Load the model from file
-        let model =
-            LlamaModel::load_from_file(&backend, &self.config.path, &model_params).map_err(
-                |e| EngineError::ModelLoadFailed(format!("failed to load model file: {e}")),
-            )?;
+        let model = LlamaModel::load_from_file(&backend, &self.config.path, &model_params)
+            .map_err(|e| EngineError::ModelLoadFailed(format!("failed to load model file: {e}")))?;
 
         info!(
             model_id = %self.config.id,
@@ -167,9 +164,9 @@ impl crate::engine::backend::InferenceBackend for LlamaBackend {
         let mut state_guard = self.state.lock().map_err(|e| {
             EngineError::InferenceFailed(format!("failed to acquire state lock: {e}"))
         })?;
-        let state = state_guard.as_mut().ok_or_else(|| {
-            EngineError::InferenceFailed("model not loaded".to_string())
-        })?;
+        let state = state_guard
+            .as_mut()
+            .ok_or_else(|| EngineError::InferenceFailed("model not loaded".to_string()))?;
 
         let id = completion_id();
         let created = unix_timestamp();
@@ -197,10 +194,7 @@ impl crate::engine::backend::InferenceBackend for LlamaBackend {
 
         // Create context params
         let batch_size = self.config.batch_size.unwrap_or(512);
-        let n_threads = self
-            .config
-            .threads
-            .map_or(4, |t| t as i32);
+        let n_threads = self.config.threads.map_or(4, |t| t as i32);
 
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(self.config.context_size))
@@ -212,9 +206,7 @@ impl crate::engine::backend::InferenceBackend for LlamaBackend {
         let mut ctx = state
             .model
             .new_context(&state.backend, ctx_params)
-            .map_err(|e| {
-                EngineError::InferenceFailed(format!("failed to create context: {e}"))
-            })?;
+            .map_err(|e| EngineError::InferenceFailed(format!("failed to create context: {e}")))?;
 
         // Process prompt tokens in batch
         let mut batch = LlamaBatch::new(batch_size as usize, 1);
@@ -222,9 +214,8 @@ impl crate::engine::backend::InferenceBackend for LlamaBackend {
             EngineError::InferenceFailed(format!("failed to add tokens to batch: {e}"))
         })?;
 
-        ctx.decode(&mut batch).map_err(|e| {
-            EngineError::InferenceFailed(format!("prompt decode failed: {e}"))
-        })?;
+        ctx.decode(&mut batch)
+            .map_err(|e| EngineError::InferenceFailed(format!("prompt decode failed: {e}")))?;
 
         // Build sampler
         let mut sampler = build_sampler(&request, self.config.seed);
@@ -276,9 +267,8 @@ impl crate::engine::backend::InferenceBackend for LlamaBackend {
                 EngineError::InferenceFailed(format!("failed to add token to batch: {e}"))
             })?;
 
-            ctx.decode(&mut batch).map_err(|e| {
-                EngineError::InferenceFailed(format!("decode step failed: {e}"))
-            })?;
+            ctx.decode(&mut batch)
+                .map_err(|e| EngineError::InferenceFailed(format!("decode step failed: {e}")))?;
         }
 
         let total_tokens = prompt_token_count + completion_tokens;
@@ -319,9 +309,9 @@ impl crate::engine::backend::InferenceBackend for LlamaBackend {
             let mut state_guard = self.state.lock().map_err(|e| {
                 EngineError::InferenceFailed(format!("failed to acquire state lock: {e}"))
             })?;
-            let state = state_guard.as_mut().ok_or_else(|| {
-                EngineError::InferenceFailed("model not loaded".to_string())
-            })?;
+            let state = state_guard
+                .as_mut()
+                .ok_or_else(|| EngineError::InferenceFailed("model not loaded".to_string()))?;
 
             let id = completion_id();
             let created = unix_timestamp();
@@ -347,10 +337,7 @@ impl crate::engine::backend::InferenceBackend for LlamaBackend {
 
             // Create context params
             let batch_size = self.config.batch_size.unwrap_or(512);
-            let n_threads = self
-                .config
-                .threads
-                .map_or(4, |t| t as i32);
+            let n_threads = self.config.threads.map_or(4, |t| t as i32);
 
             let ctx_params = LlamaContextParams::default()
                 .with_n_ctx(NonZeroU32::new(self.config.context_size))
@@ -372,9 +359,8 @@ impl crate::engine::backend::InferenceBackend for LlamaBackend {
                 EngineError::InferenceFailed(format!("failed to add tokens to batch: {e}"))
             })?;
 
-            ctx.decode(&mut batch).map_err(|e| {
-                EngineError::InferenceFailed(format!("prompt decode failed: {e}"))
-            })?;
+            ctx.decode(&mut batch)
+                .map_err(|e| EngineError::InferenceFailed(format!("prompt decode failed: {e}")))?;
 
             // Collect all chunks during synchronous inference
             let mut chunks = Vec::new();
@@ -431,8 +417,7 @@ impl crate::engine::backend::InferenceBackend for LlamaBackend {
                         generated_text.push_str(&piece);
 
                         // Check stop sequences
-                        if let Some(stop_seq) =
-                            check_stop_sequences(&generated_text, &request.stop)
+                        if let Some(stop_seq) = check_stop_sequences(&generated_text, &request.stop)
                         {
                             let trimmed_piece_len = piece.len().saturating_sub(stop_seq.len());
                             if trimmed_piece_len > 0 {
@@ -543,11 +528,7 @@ impl crate::engine::backend::InferenceBackend for LlamaBackend {
     }
 
     fn model_info(&self) -> ModelInfo {
-        let loaded = self
-            .state
-            .lock()
-            .map(|s| s.is_some())
-            .unwrap_or(false);
+        let loaded = self.state.lock().map(|s| s.is_some()).unwrap_or(false);
 
         ModelInfo {
             id: self.config.id.clone(),

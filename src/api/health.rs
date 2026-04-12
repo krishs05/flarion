@@ -1,5 +1,5 @@
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 use std::sync::Arc;
 
 use crate::api::types::HealthResponse;

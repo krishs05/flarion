@@ -1,11 +1,11 @@
-use axum::extract::State;
-use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::IntoResponse;
 use axum::Json;
+use axum::extract::State;
+use axum::response::IntoResponse;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use std::convert::Infallible;
 use std::sync::Arc;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 
 use crate::api::types::{ChatCompletionChunk, ChatCompletionRequest};
 use crate::engine::backend::InferenceBackend;
@@ -51,7 +51,9 @@ pub async fn chat_completions(
 
         let combined = stream.chain(done_stream);
 
-        Ok(Sse::new(combined).keep_alive(KeepAlive::default()).into_response())
+        Ok(Sse::new(combined)
+            .keep_alive(KeepAlive::default())
+            .into_response())
     } else {
         let response = backend
             .chat_completion(request)

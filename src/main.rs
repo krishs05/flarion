@@ -30,10 +30,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    tracing::info!(
-        "flarion v{} starting up",
-        env!("CARGO_PKG_VERSION")
-    );
+    tracing::info!("flarion v{} starting up", env!("CARGO_PKG_VERSION"));
 
     // 5. Create and load backend
     let backend = LlamaBackend::new(&config.model)?;

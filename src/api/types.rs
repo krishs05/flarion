@@ -19,9 +19,15 @@ pub struct ChatCompletionRequest {
     pub seed: Option<u32>,
 }
 
-fn default_temperature() -> f32 { 0.7 }
-fn default_top_p() -> f32 { 0.9 }
-fn default_max_tokens() -> u32 { 2048 }
+fn default_temperature() -> f32 {
+    0.7
+}
+fn default_top_p() -> f32 {
+    0.9
+}
+fn default_max_tokens() -> u32 {
+    2048
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ChatMessage {
@@ -145,10 +151,17 @@ mod tests {
             model: "test".to_string(),
             choices: vec![ChatCompletionChoice {
                 index: 0,
-                message: ChatMessage { role: "assistant".to_string(), content: "Hello!".to_string() },
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content: "Hello!".to_string(),
+                },
                 finish_reason: "stop".to_string(),
             }],
-            usage: Usage { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+            },
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["object"], "chat.completion");
@@ -165,7 +178,10 @@ mod tests {
             model: "test".to_string(),
             choices: vec![ChatCompletionChunkChoice {
                 index: 0,
-                delta: ChatDelta { role: None, content: Some("Hi".to_string()) },
+                delta: ChatDelta {
+                    role: None,
+                    content: Some("Hi".to_string()),
+                },
                 finish_reason: None,
             }],
         };

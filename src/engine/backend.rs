@@ -11,7 +11,14 @@ pub struct ModelInfo {
 #[async_trait::async_trait]
 pub trait InferenceBackend: Send + Sync {
     async fn load(&self) -> Result<(), EngineError>;
-    async fn chat_completion(&self, request: ChatCompletionRequest) -> Result<ChatCompletionResponse, EngineError>;
-    async fn chat_completion_stream(&self, request: ChatCompletionRequest, tx: tokio::sync::mpsc::Sender<ChatCompletionChunk>) -> Result<(), EngineError>;
+    async fn chat_completion(
+        &self,
+        request: ChatCompletionRequest,
+    ) -> Result<ChatCompletionResponse, EngineError>;
+    async fn chat_completion_stream(
+        &self,
+        request: ChatCompletionRequest,
+        tx: tokio::sync::mpsc::Sender<ChatCompletionChunk>,
+    ) -> Result<(), EngineError>;
     fn model_info(&self) -> ModelInfo;
 }
