@@ -23,6 +23,7 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 futures-util = "0.3"
+anyhow = "1"
 
 [dev-dependencies]
 http-body-util = "0.1"
