@@ -125,6 +125,15 @@ async fn main() -> anyhow::Result<()> {
     let registry = Arc::new(registry);
     tracing::info!(loaded = registry.len(), "all models and routes loaded");
 
+    // Bind the evictor onto every backend. Cloud backends treat this as a
+    // no-op (their default trait impl). Local backends install a Weak so
+    // the Registry→backend Arc cycle doesn't leak on shutdown.
+    let evictor: Arc<dyn flarion::engine::backend::Evictor> = registry.clone();
+    let evictor_weak = Arc::downgrade(&evictor);
+    for backend in registry.backends() {
+        backend.bind_evictor(evictor_weak.clone()).await;
+    }
+
     let app = server::create_router(
         registry.clone(),
         &config.server,
