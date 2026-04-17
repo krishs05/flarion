@@ -93,6 +93,8 @@ pub struct ModelObject {
     pub object: String,
     pub created: i64,
     pub owned_by: String,
+    /// Whether this backend currently has weights resident (lazy models are false until loaded).
+    pub loaded: bool,
 }
 
 // /health intentionally emits an ad-hoc JSON literal (see `src/api/health.rs`);
@@ -185,6 +187,7 @@ mod tests {
                 object: "model".to_string(),
                 created: 1700000000,
                 owned_by: "local".to_string(),
+                loaded: true,
             }],
         };
         let json = serde_json::to_value(&resp).unwrap();

@@ -110,11 +110,38 @@ export interface MetricsSummary {
   requests: { total: number; canceled: number; by5xx: number };
   fallbacks: number;
   evictions: number;
+  evictionsByGpu: Array<{ gpu: string; count: number }>;
   modelLoads: { success: number; over_budget: number; load_failed: number };
+  /** Sum of per-GPU budgets (cluster capacity), when `flarion_vram_budget_mb{gpu}` is present. */
   vramBudgetMb: number | null;
+  /** Per-device budget from Prometheus (Phase 2h multi-GPU). */
+  vramBudgetByGpu: Array<{ gpu: string; mb: number }>;
+  /** One row per (model, gpu) — tensor-parallel models appear on multiple GPUs. */
   vramByModel: Array<{ model: string; gpu: string | null; mb: number }>;
   firstTokenP50: number | null;
   firstTokenP95: number | null;
+}
+
+/** Budget MB for a GPU id from Phase 2h metrics, or null if unknown. */
+export function budgetMbForGpuLabel(
+  gpuKey: string,
+  budgets: Array<{ gpu: string; mb: number }>
+): number | null {
+  if (budgets.length === 0) return null;
+  const hit = budgets.find((b) => b.gpu === gpuKey);
+  if (hit) return hit.mb;
+  if (gpuKey === 'auto' && budgets.length === 1) return budgets[0].mb;
+  return null;
+}
+
+/** Sum budgets for the listed GPUs; empty `gpuKeys` means sum all (cluster total). */
+export function sumBudgetForGpuLabels(
+  gpuKeys: string[],
+  budgets: Array<{ gpu: string; mb: number }>
+): number {
+  if (budgets.length === 0) return 0;
+  if (gpuKeys.length === 0) return budgets.reduce((a, b) => a + b.mb, 0);
+  return gpuKeys.reduce((sum, g) => sum + (budgets.find((b) => b.gpu === g)?.mb ?? 0), 0);
 }
 
 export function summarize(families: Map<string, MetricFamily>): MetricsSummary {
@@ -122,8 +149,10 @@ export function summarize(families: Map<string, MetricFamily>): MetricsSummary {
     requests: { total: 0, canceled: 0, by5xx: 0 },
     fallbacks: 0,
     evictions: 0,
+    evictionsByGpu: [],
     modelLoads: { success: 0, over_budget: 0, load_failed: 0 },
     vramBudgetMb: null,
+    vramBudgetByGpu: [],
     vramByModel: [],
     firstTokenP50: null,
     firstTokenP95: null
@@ -142,7 +171,17 @@ export function summarize(families: Map<string, MetricFamily>): MetricsSummary {
   if (fb) out.fallbacks = sumAll(fb.samples);
 
   const ev = families.get('flarion_model_evictions_total');
-  if (ev) out.evictions = sumAll(ev.samples);
+  if (ev) {
+    out.evictions = sumAll(ev.samples);
+    const byGpu = new Map<string, number>();
+    for (const s of ev.samples) {
+      const g = s.labels.gpu ?? 'unknown';
+      byGpu.set(g, (byGpu.get(g) ?? 0) + s.value);
+    }
+    out.evictionsByGpu = [...byGpu.entries()]
+      .map(([gpu, count]) => ({ gpu, count }))
+      .sort((a, b) => a.gpu.localeCompare(b.gpu));
+  }
 
   const loads = families.get('flarion_model_loads_total');
   if (loads) {
@@ -154,7 +193,13 @@ export function summarize(families: Map<string, MetricFamily>): MetricsSummary {
 
   const budget = families.get('flarion_vram_budget_mb');
   if (budget && budget.samples.length > 0) {
-    out.vramBudgetMb = budget.samples.reduce((acc, s) => acc + s.value, 0);
+    const rows: Array<{ gpu: string; mb: number }> = [];
+    for (const s of budget.samples) {
+      const g = s.labels.gpu ?? '0';
+      rows.push({ gpu: g, mb: s.value });
+    }
+    out.vramBudgetByGpu = rows.sort((a, b) => a.gpu.localeCompare(b.gpu));
+    out.vramBudgetMb = rows.reduce((acc, r) => acc + r.mb, 0);
   }
 
   const reserved = families.get('flarion_vram_reserved_mb');

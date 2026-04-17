@@ -4,6 +4,7 @@
   import Layers from '@lucide/svelte/icons/layers';
   import CircleSlash from '@lucide/svelte/icons/circle-slash';
 
+  import { sumBudgetForGpuLabels } from '$lib/api/metrics';
   import { connection } from '$lib/stores/connection.svelte';
   import Card from '$lib/components/ui/Card.svelte';
   import Badge from '$lib/components/ui/Badge.svelte';
@@ -13,37 +14,51 @@
   type Row = {
     id: string;
     loaded: boolean;
-    gpu: string | null;
-    mb: number;
+    gpuKeys: string[];
+    totalMb: number;
+    budgetForBar: number;
   };
 
   let rows = $derived.by(() => {
-    const vramByModel = new Map<string, { gpu: string | null; mb: number }>();
-    if (connection.metrics) {
-      for (const m of connection.metrics.vramByModel) {
-        vramByModel.set(m.model, { gpu: m.gpu, mb: m.mb });
+    const metrics = connection.metrics;
+    const byModel = new Map<string, Array<{ gpu: string | null; mb: number }>>();
+    if (metrics) {
+      for (const v of metrics.vramByModel) {
+        if (!byModel.has(v.model)) byModel.set(v.model, []);
+        byModel.get(v.model)!.push({ gpu: v.gpu, mb: v.mb });
       }
     }
     return connection.models.map<Row>((m) => {
-      const entry = vramByModel.get(m.id);
+      const segments = byModel.get(m.id) ?? [];
+      const totalMb = segments.reduce((a, s) => a + s.mb, 0);
+      const gpuKeys = [
+        ...new Set(
+          segments.map((s) => s.gpu).filter((g): g is string => g != null && g !== '')
+        )
+      ].sort();
+      const budgets = metrics?.vramBudgetByGpu ?? [];
+      const budgetForBar =
+        budgets.length > 0 ? sumBudgetForGpuLabels(gpuKeys, budgets) : metrics?.vramBudgetMb ?? 0;
       return {
         id: m.id,
         loaded: m.loaded,
-        gpu: entry?.gpu ?? null,
-        mb: entry?.mb ?? 0
+        gpuKeys,
+        totalMb,
+        budgetForBar
       };
     });
   });
 
   let budgetMb = $derived(connection.metrics?.vramBudgetMb ?? 0);
-  let totalMb = $derived(rows.reduce((acc, r) => acc + r.mb, 0));
+  let totalMb = $derived(rows.reduce((acc, r) => acc + r.totalMb, 0));
+  let budgetByGpu = $derived(connection.metrics?.vramBudgetByGpu ?? []);
 </script>
 
 <div class="h-full overflow-y-auto">
   <div class="max-w-6xl mx-auto px-8 py-8 space-y-8">
     <Section
       title="Model Registry"
-      description="residency · pinning · per-device VRAM"
+      description="residency · per-GPU VRAM (tensor-parallel sums across devices)"
     >
       {#if !connection.connected}
         <Card padding="lg" class="flex items-center gap-3 text-graphite">
@@ -75,18 +90,20 @@
                     {:else}
                       <Badge tone="neutral" size="xs" dot>lazy</Badge>
                     {/if}
-                    {#if row.gpu}
-                      <Badge tone="cyan" size="xs">gpu · {row.gpu}</Badge>
+                    {#if row.gpuKeys.length > 0}
+                      <Badge tone="cyan" size="xs">
+                        gpu{row.gpuKeys.length > 1 ? 's' : ''} · {row.gpuKeys.join(', ')}
+                      </Badge>
                     {/if}
-                    {#if row.mb > 0}
+                    {#if row.totalMb > 0}
                       <Badge tone="violet" size="xs">
-                        {(row.mb / 1024).toFixed(2)} GiB
+                        {(row.totalMb / 1024).toFixed(2)} GiB
                       </Badge>
                     {/if}
                   </div>
-                  {#if row.loaded && budgetMb > 0 && row.mb > 0}
+                  {#if row.loaded && row.budgetForBar > 0 && row.totalMb > 0}
                     <div class="mt-2.5">
-                      <ProgressBar value={row.mb / budgetMb} tone="ember" />
+                      <ProgressBar value={row.totalMb / row.budgetForBar} tone="ember" />
                     </div>
                   {/if}
                 </div>
@@ -98,10 +115,13 @@
     </Section>
 
     {#if budgetMb > 0}
-      <Section title="Budget Utilization" description="aggregate reserved across all gpus">
+      <Section
+        title="Budget Utilization"
+        description="Σ reserved / Σ per-GPU budgets (phase 2h — multi-GPU aware)"
+      >
         <Card padding="md">
           <div class="flex items-center justify-between mb-3 font-mono text-xs">
-            <span class="text-graphite uppercase tracking-wider">reserved / budget</span>
+            <span class="text-graphite uppercase tracking-wider">cluster reserved / capacity</span>
             <span class="text-frost tabular-nums">
               {(totalMb / 1024).toFixed(2)} / {(budgetMb / 1024).toFixed(2)} GiB
             </span>
@@ -111,6 +131,29 @@
             tone={totalMb / budgetMb > 0.9 ? 'signal' : totalMb / budgetMb > 0.7 ? 'amber' : 'ember'}
           />
         </Card>
+        {#if budgetByGpu.length > 1}
+          <div class="mt-4 grid gap-3 sm:grid-cols-2">
+            {#each budgetByGpu as b (b.gpu)}
+              {@const used = connection.metrics
+                ? connection.metrics.vramByModel
+                    .filter((v) => v.gpu === b.gpu)
+                    .reduce((acc, v) => acc + v.mb, 0)
+                : 0}
+              <Card padding="md">
+                <div class="flex items-center justify-between mb-2 font-mono text-[11px] uppercase tracking-wider text-graphite">
+                  <span>gpu {b.gpu}</span>
+                  <span class="text-frost tabular-nums normal-case">
+                    {(used / 1024).toFixed(2)} / {(b.mb / 1024).toFixed(2)} GiB
+                  </span>
+                </div>
+                <ProgressBar
+                  value={b.mb > 0 ? used / b.mb : 0}
+                  tone={used / b.mb > 0.9 ? 'signal' : used / b.mb > 0.7 ? 'amber' : 'cyan'}
+                />
+              </Card>
+            {/each}
+          </div>
+        {/if}
       </Section>
     {/if}
 

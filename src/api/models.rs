@@ -15,6 +15,7 @@ pub async fn list_models(State(registry): State<Arc<BackendRegistry>>) -> Json<M
             object: "model".to_string(),
             created: now,
             owned_by: info.provider,
+            loaded: info.loaded,
         })
         .collect();
 

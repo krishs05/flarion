@@ -1,6 +1,7 @@
 use std::num::NonZeroU32;
 use std::ops::ControlFlow;
 use std::path::Path;
+use std::sync::Mutex;
 
 use tracing::{debug, info, warn};
 
@@ -208,8 +209,25 @@ pub(super) trait ModelAdapter: Send + 'static {
     ) -> Result<GenerationResult, EngineError>;
 }
 
+/// llama.cpp allows only one `llama_backend_init` per process; each worker
+/// thread used to call `LlamaCppBackend::init()`, which failed for the second
+/// local model (`BackendAlreadyInitialized`).
+static LLAMA_CPP_BACKEND: Mutex<Option<&'static LlamaCppBackend>> = Mutex::new(None);
+
+fn llama_cpp_backend() -> Result<&'static LlamaCppBackend, EngineError> {
+    let mut guard = LLAMA_CPP_BACKEND.lock().unwrap();
+    if let Some(b) = *guard {
+        return Ok(b);
+    }
+    let b = LlamaCppBackend::init().map_err(|e| {
+        EngineError::ModelLoadFailed(format!("failed to init llama backend: {e}"))
+    })?;
+    let leaked: &'static LlamaCppBackend = Box::leak(Box::new(b));
+    *guard = Some(leaked);
+    Ok(leaked)
+}
+
 struct LlamaState {
-    backend: LlamaCppBackend,
     model: LlamaModel,
 }
 
@@ -238,9 +256,7 @@ impl ModelAdapter for LlamaAdapter {
             "loading model"
         );
 
-        let backend = LlamaCppBackend::init().map_err(|e| {
-            EngineError::ModelLoadFailed(format!("failed to init llama backend: {e}"))
-        })?;
+        let backend = llama_cpp_backend()?;
 
         let mut params = LlamaModelParams::default()
             .with_n_gpu_layers(config.gpu_layers)
@@ -254,7 +270,7 @@ impl ModelAdapter for LlamaAdapter {
             })?;
         }
 
-        let model = LlamaModel::load_from_file(&backend, path, &params)
+        let model = LlamaModel::load_from_file(backend, path, &params)
             .map_err(|e| EngineError::ModelLoadFailed(format!("failed to load model: {e}")))?;
 
         info!(
@@ -264,7 +280,7 @@ impl ModelAdapter for LlamaAdapter {
             "model loaded successfully"
         );
 
-        self.state = Some(LlamaState { backend, model });
+        self.state = Some(LlamaState { model });
         Ok(())
     }
 
@@ -288,28 +304,35 @@ impl ModelAdapter for LlamaAdapter {
         let prompt_token_count = tokens.len() as u32;
 
         let context_size = config.context_size as usize;
-        if tokens.len() > context_size {
+        let prompt_len = tokens.len();
+        if prompt_len > context_size {
             return Err(EngineError::ContextLengthExceeded {
-                requested: tokens.len(),
+                requested: prompt_len,
                 max: context_size,
             });
         }
 
-        let batch_size = config.batch_size.unwrap_or(512);
+        let configured_batch = config.batch_size.map_or(512, |b| b as usize);
+        // `LlamaBatch::add_sequence` requires capacity >= prompt length; default 512 fails for
+        // long prompts (e.g. chat templates + history) with InsufficientSpace(512).
+        let batch_capacity = configured_batch.max(prompt_len).min(context_size);
+        let n_batch = u32::try_from(batch_capacity).map_err(|_| {
+            EngineError::InferenceFailed("n_batch does not fit in u32".into())
+        })?;
         let n_threads = config.threads.map_or(4, |t| t as i32);
 
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(config.context_size))
-            .with_n_batch(batch_size)
+            .with_n_batch(n_batch)
             .with_n_threads(n_threads)
             .with_n_threads_batch(n_threads);
 
         let mut ctx = state
             .model
-            .new_context(&state.backend, ctx_params)
+            .new_context(llama_cpp_backend()?, ctx_params)
             .map_err(|e| EngineError::InferenceFailed(format!("context creation failed: {e}")))?;
 
-        let mut batch = LlamaBatch::new(batch_size as usize, 1);
+        let mut batch = LlamaBatch::new(batch_capacity, 1);
         batch.add_sequence(&tokens, 0, false).map_err(|e| {
             EngineError::InferenceFailed(format!("failed to add prompt tokens: {e}"))
         })?;

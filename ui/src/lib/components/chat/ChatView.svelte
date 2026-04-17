@@ -1,6 +1,7 @@
 <script lang="ts">
   import AlertTriangle from '@lucide/svelte/icons/alert-triangle';
   import {
+    chatStore,
     getActive,
     appendMessage,
     appendToLastMessage,
@@ -63,18 +64,22 @@
     chat.model = effectiveModel;
 
     appendMessage(chatId, { role: 'user', content: text });
-    appendMessage(chatId, { role: 'assistant', content: '' });
-    streamingIndex = chat.messages.length - 1;
-    streaming = true;
+    const afterUser = chatStore.chats.find((c) => c.id === chatId);
+    if (!afterUser) return;
 
     const request: ChatCompletionRequest = {
       model: effectiveModel,
-      messages: chat.messages.slice(0, -1).map(({ role, content }) => ({ role, content })),
+      messages: afterUser.messages.map(({ role, content }) => ({ role, content })),
       temperature,
       top_p: topP,
       max_tokens: maxTokens,
       stream: true
     };
+
+    appendMessage(chatId, { role: 'assistant', content: '' });
+    const afterAssistant = chatStore.chats.find((c) => c.id === chatId);
+    streamingIndex = afterAssistant ? afterAssistant.messages.length - 1 : null;
+    streaming = true;
 
     const start = performance.now();
     let firstTokenAt: number | null = null;

@@ -179,7 +179,9 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let grace = std::time::Duration::from_secs(config.server.shutdown_grace_secs);
+    // Do not wrap `axum::serve` in `tokio::time::timeout(shutdown_grace_secs)` —
+    // that would stop the server after N seconds. `shutdown_grace_secs` is only
+    // for clamping backend drain policy in config validation, not HTTP lifetime.
 
     let serve_result: anyhow::Result<()> = match metrics_listener {
         Some((m_listener, m_app)) => {
@@ -188,37 +190,16 @@ async fn main() -> anyhow::Result<()> {
             let metrics_fut =
                 axum::serve(m_listener, m_app).with_graceful_shutdown(shutdown_signal());
 
-            let main_timed = tokio::time::timeout(grace, main_fut);
-            let metrics_timed = tokio::time::timeout(grace, metrics_fut);
-
-            let (main_res, metrics_res) = tokio::join!(main_timed, metrics_timed);
+            let (main_res, metrics_res) = tokio::join!(main_fut, metrics_fut);
             match (main_res, metrics_res) {
-                (Ok(Ok(())), Ok(Ok(()))) => Ok(()),
-                (Ok(Err(e)), _) | (_, Ok(Err(e))) => Err(e.into()),
-                (Err(_), _) | (_, Err(_)) => {
-                    tracing::warn!(
-                        grace_secs = grace.as_secs(),
-                        "shutdown grace exceeded; forcing shutdown"
-                    );
-                    Ok(())
-                }
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(e), _) | (_, Err(e)) => Err(e.into()),
             }
         }
-        None => {
-            let main_fut =
-                axum::serve(main_listener, app).with_graceful_shutdown(shutdown_signal());
-            match tokio::time::timeout(grace, main_fut).await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(e)) => Err(e.into()),
-                Err(_) => {
-                    tracing::warn!(
-                        grace_secs = grace.as_secs(),
-                        "shutdown grace exceeded; forcing shutdown"
-                    );
-                    Ok(())
-                }
-            }
-        }
+        None => axum::serve(main_listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .map_err(|e| e.into()),
     };
 
     tracing::info!("draining backend workers");

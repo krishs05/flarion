@@ -8,6 +8,7 @@
   import AlertTriangle from '@lucide/svelte/icons/alert-triangle';
   import CheckCircle2 from '@lucide/svelte/icons/check-circle-2';
 
+  import { budgetMbForGpuLabel } from '$lib/api/metrics';
   import { connection } from '$lib/stores/connection.svelte';
   import { settings } from '$lib/stores/settings.svelte';
   import Stat from '$lib/components/ui/Stat.svelte';
@@ -104,7 +105,14 @@
             <Badge tone="signal" dot>disconnected</Badge>
           {/if}
           {#if metrics && metrics.evictions > 0}
-            <Badge tone="violet">{metrics.evictions} evictions</Badge>
+            <span
+              class="inline-flex"
+              title={metrics.evictionsByGpu.map((e) => `gpu ${e.gpu}: ${e.count}`).join(' · ')}
+            >
+              <Badge tone="violet">
+                {metrics.evictions} eviction{metrics.evictions === 1 ? '' : 's'}
+              </Badge>
+            </span>
           {/if}
         </div>
       </div>
@@ -189,12 +197,22 @@
                   </div>
                 </div>
               </div>
+              {@const cap =
+                metrics
+                  ? budgetMbForGpuLabel(grp.gpu, metrics.vramBudgetByGpu) ??
+                    (metrics.vramBudgetByGpu.length === 1 ? metrics.vramBudgetByGpu[0].mb : null)
+                  : null}
               <ProgressBar
-                value={budgetMb > 0 ? grp.total / budgetMb : 0}
+                value={cap && cap > 0 ? grp.total / cap : 0}
                 tone="cyan"
               />
+              {#if cap && cap > 0}
+                <div class="mt-1 font-mono text-[10px] text-graphite tabular-nums">
+                  {(grp.total / 1024).toFixed(2)} / {(cap / 1024).toFixed(2)} GiB on device
+                </div>
+              {/if}
               <ul class="mt-3 space-y-1.5">
-                {#each grp.models as m (m.model)}
+                {#each grp.models as m (`${m.model}-${m.gpu ?? 'x'}`)}
                   <li class="flex items-center justify-between font-mono text-xs">
                     <span class="text-graphite-hi truncate">{m.model}</span>
                     <span class="text-frost tabular-nums">{(m.mb / 1024).toFixed(2)} GiB</span>

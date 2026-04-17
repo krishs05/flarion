@@ -4,7 +4,7 @@
   import Cpu from '@lucide/svelte/icons/cpu';
   import Beaker from '@lucide/svelte/icons/beaker';
   import Settings from '@lucide/svelte/icons/settings';
-  import Flame from '@lucide/svelte/icons/flame';
+  import FlarionMark from './FlarionMark.svelte';
   import { connection } from '$lib/stores/connection.svelte';
 
   export type View = 'overview' | 'chat' | 'models' | 'tester' | 'settings';
@@ -37,9 +37,14 @@
   class="w-[72px] h-screen bg-carbon/70 backdrop-blur-xl border-r border-wire
     flex flex-col items-center py-4 gap-1 shrink-0"
 >
-  <div class="w-11 h-11 rounded-xl bg-ember/10 border border-ember/30 flex items-center justify-center mb-2 ring-ember">
-    <Flame class="w-5 h-5 text-ember" />
-  </div>
+  <a
+    href="/"
+    class="w-11 h-11 rounded-xl bg-ember/10 border border-ember/30 flex items-center justify-center mb-2 ring-ember text-ember hover:bg-ember/15 transition-colors"
+    aria-label="flarion"
+    title="flarion"
+  >
+    <FlarionMark class="w-6 h-6" />
+  </a>
 
   <nav class="flex-1 flex flex-col items-center gap-1 mt-2">
     {#each items as item (item.id)}

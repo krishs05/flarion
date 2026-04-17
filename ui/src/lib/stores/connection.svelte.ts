@@ -1,4 +1,4 @@
-import { getHealth, getMetrics } from '$lib/api/client';
+import { getHealth, getMetrics, listModels } from '$lib/api/client';
 import { parseMetrics, summarize, type MetricsSummary } from '$lib/api/metrics';
 import type { ModelStatus } from '$lib/api/types';
 import { settings } from './settings.svelte';
@@ -42,16 +42,21 @@ async function checkOnce() {
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
-    const res = await getHealth(settings.baseUrl, controller.signal);
+    await getHealth(settings.baseUrl, controller.signal);
+    const listed = await listModels(settings.baseUrl, controller.signal);
+    const models: ModelStatus[] = listed.data.map((m) => ({
+      id: m.id,
+      loaded: m.loaded
+    }));
     connection.connected = true;
-    connection.version = res.version;
-    connection.allHealthy = res.all_healthy;
-    connection.models = res.models;
-    connection.modelCount = res.models.length;
-    connection.loadedCount = res.models.filter((m) => m.loaded).length;
-    const first = res.models[0];
+    connection.version = null;
+    connection.models = models;
+    connection.modelCount = models.length;
+    connection.loadedCount = models.filter((m) => m.loaded).length;
+    const first = models[0];
     connection.modelId = first?.id ?? null;
     connection.modelLoaded = first?.loaded ?? false;
+    connection.allHealthy = models.length > 0 && models.every((m) => m.loaded);
     connection.error = null;
   } catch (err) {
     connection.connected = false;

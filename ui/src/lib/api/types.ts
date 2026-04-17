@@ -54,11 +54,9 @@ export interface ModelStatus {
   loaded: boolean;
 }
 
+/** GET /health — intentionally minimal (no version / model list); see connection store + GET /v1/models. */
 export interface HealthResponse {
   status: string;
-  version: string;
-  models: ModelStatus[];
-  all_healthy: boolean;
 }
 
 export interface ModelObject {
@@ -66,6 +64,7 @@ export interface ModelObject {
   object: string;
   created: number;
   owned_by: string;
+  loaded: boolean;
 }
 
 export interface ModelsResponse {

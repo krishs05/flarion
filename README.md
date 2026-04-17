@@ -1,30 +1,474 @@
-# flarion
+<p align="center">
+  <img src="assets/flarion.svg" alt="Flarion" width="420" />
+</p>
 
-> One binary. Every model. Zero compromise.
+<h1 align="center">Flarion</h1>
 
-A Rust-native LLM inference gateway that unifies local model serving, multi-backend routing, and production observability — purpose-built for developers and small teams who self-host AI.
+<p align="center">
+  <strong>One binary. Every model. Zero compromise.</strong><br/>
+  A Rust-native LLM inference gateway — local GGUF serving, cloud backends, smart routing, and production observability in a single process.
+</p>
 
-## Status
+<p align="center">
+  <a href="#quick-start"><img alt="license" src="https://img.shields.io/badge/license-MIT-0ea5e9?style=flat-square" /></a>
+  <a href="#building"><img alt="rust" src="https://img.shields.io/badge/rust-edition%202024-orange?style=flat-square&logo=rust" /></a>
+  <a href="#building"><img alt="cuda" src="https://img.shields.io/badge/cuda-optional-76b900?style=flat-square&logo=nvidia" /></a>
+  <a href="#api"><img alt="openai compatible" src="https://img.shields.io/badge/api-OpenAI%20compatible-111?style=flat-square" /></a>
+  <a href="#metrics"><img alt="prometheus" src="https://img.shields.io/badge/metrics-Prometheus-e6522c?style=flat-square&logo=prometheus" /></a>
+</p>
 
-**Phase 2f** — Opt-in lazy loading and VRAM budget enforcement for local models. Previous milestones: Phase 1 foundation, Phase 2a multi-model registry, Phase 2b cloud backends, Phase 2c smart routing + metrics, Phase 2d security hardening, Phase 2e worker-thread inference isolation.
+---
+
+## Contents
+
+- [Why Flarion](#why-flarion)
+- [Features](#features)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Local Models & File Formats](#local-models--file-formats)
+- [Cloud Backends](#cloud-backends)
+- [Smart Routing](#smart-routing)
+- [Dashboard UI](#dashboard-ui)
+- [API](#api)
+- [Streaming](#streaming)
+- [Authentication](#authentication)
+- [Operational Hardening](#operational-hardening)
+- [Metrics](#metrics)
+- [Building](#building)
+- [GPU Support](#gpu-support)
+- [Migration Guides](#migration-guides)
+- [License](#license)
+
+---
+
+## Why Flarion
+
+Most teams either run **one model in one process** (llama.cpp server, Ollama) or reach for a **full-fat inference cluster** (vLLM, TGI). Flarion sits between them: **one process** that can serve **multiple local GGUF models** *and* **upstream cloud APIs** through the **same OpenAI-compatible endpoint**, with **routing**, **metrics**, **VRAM scheduling**, and **multi-GPU placement** built in.
+
+**Designed for:** self-hosters, internal teams, lab workstations with one or more GPUs, and anyone who wants a production-grade control plane without a Kubernetes commitment.
+
+## Features
+
+| Area | What you get |
+| --- | --- |
+| **Local inference** | llama.cpp (`llama-cpp-2`) backend with GGUF weights, full GPU offload, multi-GPU tensor split, lazy loading, LRU eviction, model pinning. |
+| **Cloud backends** | OpenAI, Groq, Anthropic — `backend = "openai" \| "groq" \| "anthropic"` behind the same API, with env-var interpolation for secrets. |
+| **Smart routing** | Per-request rules (prompt length, streaming flag, headers, content regex) with ordered backend fallback. |
+| **Observability** | Prometheus metrics: request counters, TTFT & duration histograms, VRAM budget/reservation gauges, eviction counters, build info. |
+| **Security** | Bearer token auth, SSRF guards on cloud `base_url`, CORS allow-list, opt-in plaintext upstream, dedicated metrics listener. |
+| **Multi-GPU** | Explicit `gpus = [N, M, ...]` tensor split, per-GPU VRAM budgets, best-fit auto-placement. |
+| **Graceful ops** | Configurable shutdown grace, in-flight drain, cancel-on-disconnect for streams, worker-thread inference isolation. |
+| **Dashboard** | First-party SvelteKit UI — chat, model registry, API tester, per-GPU VRAM view. |
 
 ## Quick Start
 
 ```bash
-# Build from source
+# 1. Build (CPU-only)
 cargo build --release
 
-# Create a config file
+# 2. Configure
 cp flarion.toml my-config.toml
-# Edit my-config.toml with your model path
+# edit [[models]].path to point at a .gguf file
 
-# Run
+# 3. Run
 ./target/release/flarion -c my-config.toml
 ```
 
-## Upgrading from Phase 1
+Then:
 
-The config format changed in v0.2.0 to support multiple models. Rewrite a single-model config:
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"my-model","messages":[{"role":"user","content":"hello"}]}'
+```
+
+Launch the dashboard:
+
+```bash
+cd ui && npm install && npm run dev
+# open http://localhost:5173 · point it at http://127.0.0.1:8080 in Settings
+```
+
+## Configuration
+
+A minimal `my-config.toml`:
+
+```toml
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[[models]]
+id      = "my-model"
+backend = "local"
+path    = "/models/my-model.gguf"
+context_size = 4096
+gpu_layers   = 99
+
+[logging]
+level = "info"
+
+[metrics]
+enabled = true
+path    = "/metrics"
+```
+
+See `flarion.toml` for a complete, commented reference (routes, cloud backends, VRAM budgets, multi-GPU placement, per-model caps).
+
+## Local Models & File Formats
+
+`backend = "local"` uses **llama.cpp** under the hood and loads **GGUF** weights via `path = "…"`. Flarion does **not** natively read Hugging Face folders, `safetensors`, or PyTorch `.bin` checkpoints.
+
+If your weights are not GGUF:
+
+1. **Convert to GGUF** using the upstream [llama.cpp](https://github.com/ggerganov/llama.cpp) conversion and quantization tooling, then point `path` at the resulting file.
+2. **Delegate inference** — run Ollama, LM Studio, vLLM, TGI, or any **OpenAI-compatible** server, and front it with a `[[models]]` entry using `backend = "openai"`, `base_url = "http://127.0.0.1:…"`, and the appropriate `upstream_model` / `api_key`.
+
+**Long prompts.** If the formatted prompt exceeds the configured `batch_size` (default `512`), Flarion raises the effective batch size for that request up to `context_size` so the prompt fits in a single decode. No configuration change required for typical chat workloads.
+
+## Cloud Backends
+
+Declare cloud-hosted models alongside local ones:
+
+```toml
+[[models]]
+id             = "gpt-4o"
+backend        = "openai"
+api_key        = "${OPENAI_API_KEY}"
+upstream_model = "gpt-4o"           # optional; defaults to `id`
+# base_url     = "https://openrouter.ai/api/v1"   # optional override
+# timeout_secs = 300                              # optional
+
+[[models]]
+id             = "groq-llama-3.3-70b"
+backend        = "groq"
+api_key        = "${GROQ_API_KEY}"
+upstream_model = "llama-3.3-70b-versatile"
+
+[[models]]
+id             = "claude-sonnet"
+backend        = "anthropic"
+api_key        = "${ANTHROPIC_API_KEY}"
+upstream_model = "claude-sonnet-4-5-20250929"
+```
+
+Clients see only the local `id`. Each request's `model` field selects which configured backend serves it.
+
+## Smart Routing
+
+A **route** is a client-facing model id that resolves to one of several backends based on request shape, with ordered fallback on failure:
+
+```toml
+[[routes]]
+id                     = "chat"
+first_token_timeout_ms = 5000
+
+  [[routes.rules]]
+  name     = "long-prompt"
+  matchers = { prompt_tokens_gte = 4000 }
+  targets  = ["cloud-long"]
+
+  [[routes.rules]]
+  name     = "streaming-default"
+  matchers = { stream = true }
+  targets  = ["local-qwen", "cloud-small"]
+
+  [[routes.rules]]
+  name     = "fallback"
+  matchers = {}
+  targets  = ["cloud-small"]
+```
+
+**Matcher keys** (all optional, AND-combined):
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `stream` | bool | matches request's `stream` flag |
+| `prompt_tokens_gte` / `_lte` | u32 | approximate token count (`chars / 4`) |
+| `message_count_gte` / `_lte` | u32 | number of messages |
+| `has_system_prompt` | bool | whether any message has `role = "system"` |
+| `content_regex` | string | regex matched against the last user message |
+| `header_equals` | table | exact match on request headers |
+
+**Fallback behavior.** On retryable errors (timeout, network, HTTP 5xx/429) the router tries the next target. Non-retryable errors surface immediately. Streaming: the fallback window closes at the first chunk; mid-stream failures surface as an error.
+
+**Response headers (non-streaming):**
+
+- `X-Flarion-Route` — route id that served (or `direct`)
+- `X-Flarion-Rule` — rule name that matched
+- `X-Flarion-Backend` — the real backend that served
+- `X-Flarion-Fallback-Count` — how many backends failed before this one
+
+**Validation.** Route and model ids share one namespace; startup fails on collisions. Every route must include a catch-all (`matchers = {}`) rule.
+
+## Dashboard UI
+
+A SvelteKit app under `ui/` provides:
+
+- **Overview** — cluster status, request volume, TTFT p50/p95, per-GPU VRAM, evictions
+- **Chat** — streaming OpenAI-compatible chat with model selector, sampling popover, abortable streams, persistent history
+- **Models** — registry with loaded / pinned / lazy chips, per-model VRAM bar, aggregate budget utilization
+- **API Tester** — `/health`, `/v1/models`, and `/v1/chat/completions` sandboxes
+- **Settings** — endpoint, sampling defaults, local data management
+
+See [`ui/README.md`](ui/README.md) for run & build instructions.
+
+## API
+
+OpenAI-compatible surface:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `POST` | `/v1/chat/completions` | Chat completions (streaming + non-streaming) |
+| `GET`  | `/v1/models` | List loaded models |
+| `GET`  | `/health` | Liveness check (always public) |
+| `GET`  | `/metrics` | Prometheus exposition (when enabled) |
+
+## Streaming
+
+v0.6.0 switched to true token-by-token streaming. Chunks arrive progressively as tokens are generated, matching the OpenAI streaming contract. OpenAI SDK, LangChain, raw SSE parsers — all work unchanged.
+
+**Cancel-on-disconnect.** If the HTTP connection drops mid-stream, Flarion aborts generation within ~1 token between decodes. Saves GPU cycles under flaky-client traffic. Canceled requests increment `flarion_requests_total{status="canceled"}`.
+
+## Authentication
+
+Flarion accepts unauthenticated requests by default — convenient for local development. To require auth, add keys to `[server]`:
+
+```toml
+[server]
+api_keys = ["${FLARION_KEY_DEV}", "${FLARION_KEY_TEAM}"]
+```
+
+When `api_keys` is set:
+
+- All `/v1/*` endpoints require `Authorization: Bearer <key>` matching one of the configured keys.
+- `/health` stays open so monitoring / load balancers can probe.
+- Missing or invalid keys return `401` with an OpenAI-style error body.
+
+Keys are compared in constant time.
+
+## Operational Hardening
+
+### Authentication posture
+
+Flarion refuses to start when all three are true:
+
+- Server binds to a non-loopback interface (e.g. `host = "0.0.0.0"`)
+- `[server].api_keys` is empty
+- `[server].allow_unauthenticated` is not set to `true`
+
+Fix by setting one of:
+
+```toml
+[server]
+api_keys = ["${FLARION_KEY}"]        # preferred
+# OR
+allow_unauthenticated = true         # only if an upstream proxy handles auth
+```
+
+Loopback binds (`127.0.0.1`, `::1`, `localhost`) retain today's open-by-default behavior for dev UX and emit a warning at startup.
+
+### CORS
+
+- Empty `cors_origins` + loopback bind → permissive for dev.
+- Empty list + public bind → all cross-origin requests denied.
+- Explicit list wins:
+
+  ```toml
+  [server]
+  cors_origins = ["https://app.example.com", "https://staging.example.com"]
+  ```
+
+### SSRF protection on cloud backends
+
+`base_url` on `openai` / `groq` / `anthropic` entries is validated at startup. Plaintext `http://`, loopback hosts, link-local, and RFC-1918 private ranges are rejected by default. Override for legitimate dev use:
+
+```toml
+[server]
+allow_plaintext_upstream = true      # enables http://, 127.0.0.1, 192.168.x.x, etc.
+```
+
+### Dedicated metrics listener
+
+Move `/metrics` off the main listener to bypass auth for Prometheus scrapers on a trusted interface:
+
+```toml
+[metrics]
+enabled = true
+bind    = "127.0.0.1:9091"
+```
+
+### Per-model request caps
+
+Each `[[models]]` entry can override the global 8192 `max_tokens` ceiling:
+
+```toml
+[[models]]
+id             = "gpt-5.4-long"
+backend        = "openai"
+api_key        = "${OPENAI_API_KEY}"
+max_tokens_cap = 16384
+```
+
+Requests above the effective cap are silently clamped.
+
+### Graceful shutdown
+
+On SIGTERM / Ctrl+C the server stops accepting connections and waits for in-flight inferences to finish:
+
+```toml
+[server]
+shutdown_grace_secs = 30
+```
+
+- `0` — abort all in-flight; streams terminate abruptly.
+- `1..=3600` — wait up to N seconds, then abandon workers and exit.
+- Default `30`. Values above `3600` are clamped with a startup warning.
+
+### Lazy loading & VRAM budgets
+
+Mark rarely-used models with `lazy = true`; combine with `[server].vram_budget_mb` to declare more local models than fit in VRAM:
+
+```toml
+[server]
+vram_budget_mb = 22000               # or "auto" (NVML, minus headroom)
+
+[[models]]
+id           = "small"
+backend      = "local"
+path         = "/models/qwen3-8b-q4.gguf"
+gpu_layers   = 99
+context_size = 8192
+
+[[models]]
+id           = "big"
+backend      = "local"
+path         = "/models/llama3-70b-q4.gguf"
+gpu_layers   = 99
+context_size = 8192
+lazy         = true                  # loaded on first request
+```
+
+- First request to a lazy model pays a 3–10 s cold-start cost.
+- If loading would exceed the budget, Flarion evicts the least-recently-used unpinned, non-busy model. If no candidate exists (all pinned or all busy), the request returns 503 with `Retry-After: 5`.
+- VRAM footprint is estimated as `file size × 1.2` unless `vram_mb` overrides it.
+
+## Metrics
+
+Enable Prometheus exposition:
+
+```toml
+[metrics]
+enabled = true
+path    = "/metrics"
+```
+
+#### Counters
+
+- `flarion_requests_total{route, backend, status}`
+- `flarion_route_rule_matches_total{route, rule}`
+- `flarion_fallbacks_total{route, from_backend, to_backend, reason}`
+- `flarion_route_exhausted_total{route}`
+- `flarion_model_loads_total{model, result}` — `{success, over_budget, load_failed}`
+- `flarion_model_evictions_total{gpu, model, reason}`
+- `flarion_model_unloads_total{model, result}`
+
+#### Histograms
+
+- `flarion_first_token_seconds{route, backend}`
+- `flarion_request_duration_seconds{route, backend}`
+- `flarion_prompt_tokens{route, backend}`
+- `flarion_completion_tokens{route, backend}`
+
+#### Gauges
+
+- `flarion_build_info{version}`
+- `flarion_vram_budget_mb{gpu}`
+- `flarion_vram_reserved_mb{gpu, model}`
+- `flarion_backend_poisoned{model}`
+
+## Building
+
+```bash
+# CPU-only
+cargo build --release
+```
+
+Requires Rust edition 2024. Build produces `target/release/flarion` (`.exe` on Windows).
+
+### GPU Support
+
+```bash
+# CUDA (NVIDIA)
+cargo build --release --features cuda
+```
+
+The `cuda` feature links llama.cpp against your local CUDA toolkit. Match your toolkit version to what `llama-cpp-sys` expects; see `.cargo/config.toml` for any pinned `CUDA_PATH`.
+
+**Windows runtime:** prepend the toolkit `bin` to `PATH` so CUDA DLLs (e.g. `cublas64_*.dll`) resolve:
+
+```powershell
+$env:Path = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin;" + $env:Path
+.\target\release\flarion.exe -c my-config.toml
+```
+
+**If `cargo build` fails with "Access denied" replacing `flarion.exe`:** stop the running process, or build into a separate tree:
+
+```powershell
+cargo build --release --features cuda --target-dir target/cuda-release
+.\target\cuda-release\release\flarion.exe -c my-config.toml
+```
+
+## Migration Guides
+
+### From 0.8.x → 0.9.0 — multi-GPU scheduling
+
+All additive; single-GPU configs run unchanged.
+
+1. **Explicit placement.** Add `gpus = [0]` (or `[1]`, etc.) to any `[[models]]` entry to pin it.
+2. **Tensor-parallel split.** For models bigger than any single GPU's VRAM, use `gpus = [0, 1, 2, ...]`. Flarion invokes `llama-cpp-2` with `with_devices(&[...]) + with_split_mode(LlamaSplitMode::Layer)`.
+3. **Mixed hardware.** Set `vram_budget_overrides = { 0 = N, 1 = M }` in `[server]` to give specific GPUs different budgets.
+4. **Auto-placement.** Leave `gpus` unset (or `[]`) to let Flarion pick the GPU with the most free budget at first load. Decision is sticky for the model's lifetime (reset on unload).
+
+Metric label changes: `flarion_vram_budget_mb`, `flarion_vram_reserved_mb`, and `flarion_model_evictions_total` all gained a `gpu` label.
+
+### From 0.7.x → 0.8.0 — LRU hot-swap, pinning, NVML auto-budget
+
+- Set `vram_budget_mb = "auto"` (+ `vram_budget_headroom_mb = 2048`) to derive the budget from NVML at startup.
+- Mark always-on models with `pin = true`. Flarion refuses to start if pinned local models exceed the budget.
+- When a lazy model's load would exceed the budget, Flarion now **evicts** the LRU unpinned non-busy model instead of returning 503.
+- 503 `model_unavailable` now carries `Retry-After: 5`; OpenAI-compatible clients retry automatically.
+- New metrics: `flarion_model_evictions_total`, `flarion_model_unloads_total`.
+
+### From 0.6.x → 0.7.0 — lazy loading & VRAM budgets
+
+Opt-in; default behavior identical to 0.6.x.
+
+1. Set `[server].vram_budget_mb` to your GPU's usable VRAM.
+2. Mark infrequently-used models with `lazy = true`.
+3. Lazy models pay a 3–10 s cold-start on first hit.
+4. Budget exceedance → 503 `model_unavailable`.
+
+New metrics: `flarion_vram_budget_mb`, `flarion_vram_reserved_mb{model}`, `flarion_model_loads_total{model, result}`.
+
+### From 0.5.x → 0.6.0 — streaming & worker-thread isolation
+
+No API/config breaks, but:
+
+- Streaming is now truly token-by-token (was batched in 0.5.x).
+- New: `[server].shutdown_grace_secs` (default 30).
+- New metrics: `flarion_requests_total{status="canceled"}`, `flarion_backend_poisoned{model}`.
+- Internal `unsafe impl Send/Sync` for `LlamaBackend` removed in favor of a worker-thread model.
+
+### From 0.4.x → 0.5.0 — secure defaults **(breaking)**
+
+- Empty `api_keys` on a public bind **refuses to start**. Set `api_keys = [...]` (recommended) or `allow_unauthenticated = true`.
+- `base_url` on cloud models is validated; `http://`, loopback, and private-range URLs require `allow_plaintext_upstream = true`.
+- CORS is no longer permissive on public binds — configure `cors_origins`.
+
+Loopback deployments are unaffected.
+
+### From Phase 1 — multi-model config format
 
 ```diff
 - [model]
@@ -36,380 +480,6 @@ The config format changed in v0.2.0 to support multiple models. Rewrite a single
   gpu_layers = 99
 ```
 
-You can now declare additional `[[models]]` entries to serve multiple models from the same instance. Request routing uses the `model` field in chat completion requests to pick a backend; unknown model ids return 404 with the list of available models.
-
-## Configuration
-
-See `flarion.toml` for a complete example.
-
-## API
-
-flarion exposes an OpenAI-compatible API:
-
-- `POST /v1/chat/completions` — Chat completions (streaming + non-streaming)
-- `GET /v1/models` — List loaded models
-- `GET /health` — Health check
-
-## Streaming
-
-v0.6.0 switched to true token-by-token streaming. Chunks arrive
-progressively as tokens are generated, matching the OpenAI streaming
-contract. Most clients (OpenAI SDK, LangChain, raw SSE parsers) handle
-this natively — no client-side changes needed.
-
-Client-disconnect cancellation: if the HTTP connection drops mid-stream,
-Flarion observes the disconnect between token decodes and aborts
-generation within ~1 token. Saves GPU cycles under flaky-client traffic.
-Requests canceled this way count under
-`flarion_requests_total{status="canceled"}`.
-
-## Cloud Backends
-
-flarion can serve OpenAI, Groq, and Anthropic models behind the same OpenAI-compatible API as your local models. Add a `[[models]]` entry with `backend = "openai" | "groq" | "anthropic"` and an `api_key`. Use `${VAR}` env var interpolation to keep secrets out of `flarion.toml`:
-
-```toml
-[[models]]
-id = "gpt-4o"
-backend = "openai"
-api_key = "${OPENAI_API_KEY}"
-```
-
-Optional fields per cloud entry:
-- `upstream_model` — model id sent to the upstream provider (defaults to the local `id`)
-- `base_url` — override the provider's default endpoint (useful for proxies, OpenRouter, etc.)
-- `timeout_secs` — request timeout in seconds (default 300)
-
-Clients see only the local `id`, regardless of what's running upstream. Each request's `model` field selects which configured backend handles it.
-
-## Authentication
-
-By default, the flarion server accepts unauthenticated requests — convenient for local development. To require authentication, add `api_keys` to `[server]`:
-
-```toml
-[server]
-api_keys = ["${FLARION_KEY_DEV}", "${FLARION_KEY_TEAM}"]
-```
-
-When `api_keys` is set:
-- All `/v1/*` endpoints require `Authorization: Bearer <key>` matching one of the configured keys
-- `/health` remains open (so monitoring / load balancers can check it)
-- Missing or invalid keys return `401` with an OpenAI-style error body
-
-Keys are compared in constant time. Use multiple keys to distribute different values to different teammates without sharing the same secret.
-
-## Smart Routing
-
-Routes let you address a single client-facing model id that resolves to one of several backends based on request shape, with ordered fallback on failure. Clients send `model: "chat"` and the router picks the real backend.
-
-```toml
-[[routes]]
-id = "chat"
-first_token_timeout_ms = 5000
-
-  [[routes.rules]]
-  name = "long-prompt"
-  matchers = { prompt_tokens_gte = 4000 }
-  targets = ["cloud-long"]
-
-  [[routes.rules]]
-  name = "fallback"
-  matchers = {}
-  targets = ["cloud-small"]
-```
-
-**Matcher keys** (all optional, AND-combined):
-
-| Key | Type | Description |
-|---|---|---|
-| `stream` | bool | matches request's `stream` flag |
-| `prompt_tokens_gte` / `_lte` | u32 | approximate token count (`chars / 4`) |
-| `message_count_gte` / `_lte` | u32 | number of messages |
-| `has_system_prompt` | bool | whether any message has `role = "system"` |
-| `content_regex` | string | regex matched against last user message |
-| `header_equals` | table | exact match on request headers |
-
-**Fallback behavior:** if a target fails with a retryable error (timeout, network, HTTP 5xx, HTTP 429) the router tries the next target in the chain. Non-retryable errors (4xx) surface immediately. For streaming, the fallback window closes at the first chunk — mid-stream failures become an error to the client with no retry.
-
-**Validation:** routes and model ids share one namespace; startup fails on collisions. Every route must have a catch-all rule (`matchers = {}`).
-
-**Response headers** (non-streaming):
-- `X-Flarion-Route` — route id that served (or `direct`)
-- `X-Flarion-Rule` — rule name that matched
-- `X-Flarion-Backend` — the real backend that served
-- `X-Flarion-Fallback-Count` — how many backends failed before this one
-
-## Metrics
-
-flarion exports Prometheus-format metrics when enabled:
-
-```toml
-[metrics]
-enabled = true
-path = "/metrics"
-```
-
-**Counters**
-
-- `flarion_requests_total{route, backend, status}`
-- `flarion_route_rule_matches_total{route, rule}`
-- `flarion_fallbacks_total{route, from_backend, to_backend, reason}`
-- `flarion_route_exhausted_total{route}`
-- `flarion_model_loads_total{model, result}` — model load attempts (success, over_budget, load_failed)
-
-**Histograms**
-
-- `flarion_first_token_seconds{route, backend}`
-- `flarion_request_duration_seconds{route, backend}`
-- `flarion_prompt_tokens{route, backend}`
-- `flarion_completion_tokens{route, backend}`
-
-**Gauges**
-
-- `flarion_build_info{version}`
-- `flarion_vram_budget_mb` — configured VRAM budget (set once at startup)
-- `flarion_vram_reserved_mb{model}` — current reserved VRAM per model
-
-## Operational Hardening
-
-Flarion defaults are tuned for local development. Before exposing a Flarion
-instance beyond localhost, review these settings.
-
-### Authentication posture
-
-Flarion refuses to start when all three are true:
-- Server binds to a non-loopback interface (e.g. `host = "0.0.0.0"`)
-- `[server].api_keys` is empty
-- `[server].allow_unauthenticated` is not set to `true`
-
-Fix by setting one of:
-
-```toml
-[server]
-api_keys = ["${FLARION_KEY}"]       # preferred
-# OR
-allow_unauthenticated = true        # only if an upstream proxy handles auth
-```
-
-Loopback binds (`127.0.0.1`, `::1`, `localhost`) retain today's open-by-default
-behavior for dev UX and emit a warning log at startup.
-
-### CORS
-
-Empty `cors_origins` + loopback bind = permissive for dev. Empty list +
-public bind = all cross-origin requests denied. Configure an explicit
-allow-list when serving a browser UI from a different origin:
-
-```toml
-[server]
-cors_origins = ["https://app.example.com", "https://staging.example.com"]
-```
-
-### SSRF protection on cloud backends
-
-`base_url` on `openai`/`groq`/`anthropic` entries is validated at startup.
-By default, plaintext `http://`, loopback hosts, link-local, and RFC-1918
-private ranges are rejected. Override for legitimate uses (e.g. pointing at
-a local proxy during development):
-
-```toml
-[server]
-allow_plaintext_upstream = true     # enables http://, 127.0.0.1, 192.168.x.x, etc.
-```
-
-### Dedicated metrics listener
-
-When Prometheus scraping needs to bypass the auth layer, move `/metrics` to
-a dedicated listener bound to a trusted interface:
-
-```toml
-[metrics]
-enabled = true
-bind = "127.0.0.1:9091"             # scraper runs on the same host
-```
-
-The main listener no longer serves `/metrics`; the dedicated listener has
-no auth layer.
-
-### Per-model request caps
-
-Each `[[models]]` entry can override the global 8192 `max_tokens` ceiling:
-
-```toml
-[[models]]
-id = "gpt-5.4-long"
-backend = "openai"
-api_key = "${OPENAI_API_KEY}"
-max_tokens_cap = 16384
-```
-
-Requests above the effective cap are silently clamped.
-
-### Graceful shutdown
-
-On SIGTERM/Ctrl+C the server stops accepting new connections and waits for
-in-flight inferences to finish before exiting. The grace budget is
-configurable:
-
-```toml
-[server]
-shutdown_grace_secs = 30
-```
-
-- `0` — abort all in-flight immediately; streams terminate abruptly, process
-  exits within a few hundred milliseconds.
-- `1..=3600` — wait up to N seconds for inferences to finish; after the
-  budget, worker threads are abandoned and the process exits anyway.
-- Default: `30`. Values above `3600` are clamped with a startup warning.
-
-### Lazy loading
-
-Mark rarely-used models with `lazy = true` to defer their load until the
-first request. Combined with `[server].vram_budget_mb`, this lets you
-declare multiple local models whose combined footprint exceeds VRAM, as
-long as you don't load them all at once.
-
-```toml
-[server]
-vram_budget_mb = 22000   # enforce against this budget
-
-[[models]]
-id = "small"
-backend = "local"
-path = "/models/qwen3-8b-q4.gguf"
-gpu_layers = 99
-context_size = 8192
-# Loaded eagerly at startup (default).
-
-[[models]]
-id = "big"
-backend = "local"
-path = "/models/llama3-70b-q4.gguf"
-gpu_layers = 99
-context_size = 8192
-lazy = true              # loaded on first request
-```
-
-- First request to a lazy model pays a 3-10s cold-start cost; subsequent
-  requests are fast.
-- If loading would exceed `vram_budget_mb`, the request returns 503
-  `model_unavailable`. Phase 2g (future release) adds LRU eviction; for
-  0.7.0 you remove/restart to free budget.
-- Budget is advisory — Flarion refuses based on the configured value
-  and the estimated footprint (`file size * 1.2`, or `vram_mb` override).
-  Actual CUDA allocations might differ; set conservatively.
-
-## Migrating from 0.8.x
-
-v0.9.0 adds multi-GPU scheduling — explicit placement, tensor-parallel
-split, and best-fit auto-placement. All changes are additive; single-GPU
-configs run unchanged.
-
-To use:
-
-1. **Explicit placement.** Add `gpus = [0]` (or `[1]`, etc.) to any
-   `[[models]]` entry to pin it to a specific GPU.
-2. **Tensor-parallel split.** For models bigger than any single GPU's
-   VRAM, use `gpus = [0, 1, 2, ...]`. Flarion invokes llama-cpp-2 with
-   `with_devices(&[...]) + with_split_mode(LlamaSplitMode::Layer)`;
-   llama-cpp-2 distributes the model's layers across the listed devices
-   internally.
-3. **Mixed hardware.** Set `vram_budget_overrides = { 0 = N, 1 = M }`
-   in `[server]` to give specific GPUs different budgets.
-4. **Auto-placement.** Leave `gpus` unset (or `= []`) to let Flarion
-   pick the GPU with most free budget at first load. Decision is sticky
-   for the model's lifetime (reset when the model unloads).
-
-Metric label changes:
-- `flarion_vram_budget_mb{gpu}` — gained `gpu` label
-- `flarion_vram_reserved_mb{gpu, model}` — gained `gpu` label
-- `flarion_model_evictions_total{gpu, model, reason}` — gained `gpu` label
-
-## Migrating from 0.7.x
-
-v0.8.0 adds LRU hot-swap, model pinning, and NVML-based auto VRAM detection.
-All changes are opt-in; default behavior is identical to 0.7.x.
-
-- Set `vram_budget_mb = "auto"` (+ `vram_budget_headroom_mb = 2048`) to let
-  Flarion pick the budget from NVML at startup.
-- Mark always-on models with `pin = true`. Flarion refuses to start if pinned
-  local models total more than the budget.
-- When a lazy model's load would exceed the budget, Flarion now evicts the
-  least-recently-used unpinned non-busy model instead of returning 503. If
-  no eviction candidate is available (all pinned or all busy), the request
-  returns 503 with `Retry-After: 5`.
-- 503 `model_unavailable` responses now carry `Retry-After: 5`;
-  OpenAI-compatible clients that honor the header retry automatically.
-
-New metrics:
-- `flarion_model_evictions_total{model, reason}`
-- `flarion_model_unloads_total{model, result}`
-
-## Migrating from 0.6.x
-
-v0.7.0 adds lazy loading and VRAM budget scheduling. All changes are
-opt-in; default behavior is identical to 0.6.x.
-
-To use:
-
-1. Set `[server].vram_budget_mb` to your GPU's usable VRAM (MB).
-2. Mark infrequently-used models with `lazy = true`.
-3. Requests to lazy models pay a 3-10s cold-start cost on first hit,
-   then behave identically to eager models.
-4. If a load would exceed budget, the request returns 503
-   `model_unavailable`. Phase 2g (next release) adds LRU eviction; for
-   0.7.0 you manage loaded models by removing entries and restarting.
-
-New metrics:
-
-- `flarion_vram_budget_mb` — configured budget (gauge)
-- `flarion_vram_reserved_mb{model}` — per-model reservation (gauge)
-- `flarion_model_loads_total{model, result}` — counter with result in
-  {success, over_budget, load_failed}
-
-## Migrating from 0.5.x
-
-v0.6.0 is a minor-but-notable release. No API or config breaks, but:
-
-- Streaming is now truly token-by-token (was batched-and-flushed in
-  0.5.x). If you had client code that relied on all chunks arriving at
-  once, adjust to handle the standard progressive-chunk pattern.
-- New config knob `[server].shutdown_grace_secs` (default 30).
-- New metrics: `flarion_requests_total{status="canceled"}` and
-  `flarion_backend_poisoned{model}` gauge.
-- The internal `unsafe impl Send/Sync` for `LlamaBackend` is gone —
-  worker-thread model. No externally visible change, but if you were
-  vendoring the crate this is a notable soundness improvement.
-
-## Migrating from 0.4.x
-
-v0.5.0 is a **breaking release** on the auth default.
-
-Before (0.4.x): empty `api_keys` meant "accept all requests, on any bind".
-
-After (0.5.0): empty `api_keys` on a public bind refuses to start.
-
-If you run Flarion on `0.0.0.0` or a public hostname without `api_keys`, you
-have two options:
-
-1. Set `api_keys = [...]` (recommended).
-2. Set `[server].allow_unauthenticated = true` (opt-in if an upstream proxy
-   handles authentication).
-
-Loopback deployments are unaffected.
-
-Other 0.5.0 changes:
-- `base_url` on cloud models is now validated — `http://`, loopback, and
-  private-range URLs require `[server].allow_plaintext_upstream = true`.
-- CORS is no longer permissive on public binds by default — configure
-  `[server].cors_origins` to allow browser clients.
-
-## Building with GPU Support
-
-```bash
-# CUDA (NVIDIA)
-cargo build --release --features cuda
-```
-
 ## License
 
-MIT
+[MIT](LICENSE)
