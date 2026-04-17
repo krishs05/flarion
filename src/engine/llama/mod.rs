@@ -235,6 +235,72 @@ impl LlamaBackend {
         notify.notify_waiters();
     }
 
+    /// Request-path entry point. Returns an RAII guard that keeps
+    /// `in_flight > 0` for the duration of the request, preventing the
+    /// model from being chosen as an eviction victim while in use.
+    /// Acquires `in_flight` under `load_state` lock for atomicity with
+    /// `unload`'s busy check (Task 13).
+    pub(crate) async fn ensure_loaded_for_request(
+        &self,
+    ) -> Result<InFlightGuard, EngineError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(EngineError::BackendPoisoned);
+        }
+        if self.draining.load(Ordering::Acquire) {
+            return Err(EngineError::BackendDraining);
+        }
+
+        loop {
+            let notify = {
+                let mut guard = self.load_state.lock().await;
+                match &*guard {
+                    LoadState::Loaded(_) => {
+                        // Bump in_flight while still holding the state lock
+                        // so unload's in_flight check (Task 13) can't race.
+                        self.in_flight.fetch_add(1, Ordering::Release);
+                        self.touch_last_used();
+                        return Ok(InFlightGuard::new(self.in_flight.clone()));
+                    }
+                    LoadState::Loading(n) => n.clone(),
+                    LoadState::Unloaded => {
+                        let n = Arc::new(Notify::new());
+                        *guard = LoadState::Loading(n.clone());
+                        drop(guard);
+                        return self.load_as_leader_for_request(n).await;
+                    }
+                }
+            };
+            notify.notified().await;
+        }
+    }
+
+    /// Variant of `load_as_leader` that returns an `InFlightGuard` on success
+    /// (so the request caller observes `in_flight >= 1` continuously from
+    /// the moment the load begins until the request drops its guard).
+    async fn load_as_leader_for_request(
+        &self,
+        notify: Arc<Notify>,
+    ) -> Result<InFlightGuard, EngineError> {
+        // Loading sentinel: keep in_flight > 0 while the load is in progress
+        // so pick_eviction_candidates won't pick this not-yet-loaded model.
+        self.in_flight.fetch_add(1, Ordering::Release);
+        let sentinel = InFlightGuard::new(self.in_flight.clone());
+
+        match self.load_as_leader(notify).await {
+            Ok(()) => {
+                // Transfer ownership: forget the sentinel (avoiding its Drop
+                // decrement) and hand the caller a fresh guard. Net effect:
+                // in_flight stays at +1, caller's guard decrements on drop.
+                std::mem::forget(sentinel);
+                Ok(InFlightGuard::new(self.in_flight.clone()))
+            }
+            Err(e) => {
+                drop(sentinel);
+                Err(e)
+            }
+        }
+    }
+
     /// Snapshot helper for chat_completion paths: clones the current cmd_tx
     /// if Loaded. Does NOT bump `in_flight` (Task 12 adds a request-path
     /// wrapper that does so atomically).
@@ -255,6 +321,22 @@ impl LlamaBackend {
     }
 }
 
+pub(crate) struct InFlightGuard {
+    counter: Arc<AtomicU32>,
+}
+
+impl InFlightGuard {
+    fn new(counter: Arc<AtomicU32>) -> Self {
+        Self { counter }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Release);
+    }
+}
+
 #[async_trait]
 impl InferenceBackend for LlamaBackend {
     async fn load(&self) -> Result<(), EngineError> {
@@ -265,7 +347,7 @@ impl InferenceBackend for LlamaBackend {
         &self,
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, EngineError> {
-        self.ensure_loaded().await?;
+        let _guard = self.ensure_loaded_for_request().await?;
         let cmd_tx = self.cmd_tx().await?;
         let (ack_tx, ack_rx) = oneshot::channel();
         cmd_tx
@@ -283,7 +365,7 @@ impl InferenceBackend for LlamaBackend {
         request: ChatCompletionRequest,
         tx: mpsc::Sender<ChatCompletionChunk>,
     ) -> Result<(), EngineError> {
-        self.ensure_loaded().await?;
+        let _guard = self.ensure_loaded_for_request().await?;
         let cmd_tx = self.cmd_tx().await?;
         let (done_tx, done_rx) = oneshot::channel();
         cmd_tx
@@ -591,5 +673,57 @@ mod tests {
         backend.touch_last_used();
         let after = backend.last_used_ms.load(std::sync::atomic::Ordering::Acquire);
         assert!(after > before, "before={before} after={after}");
+    }
+
+    #[tokio::test]
+    async fn in_flight_guard_increments_and_decrements() {
+        let backend = LlamaBackend::new(
+            &test_config(),
+            crate::engine::scheduling::ResidentSet::new(0),
+            0,
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+        .unwrap();
+        // Simulate a loaded state by directly transitioning — we're only
+        // testing InFlightGuard bookkeeping, not the load path.
+        {
+            let (dummy_tx, _rx) = tokio::sync::mpsc::channel(1);
+            let mut guard = backend.load_state.lock().await;
+            *guard = LoadState::Loaded(LoadedState {
+                cmd_tx: dummy_tx,
+                worker_handle: None,
+            });
+        }
+
+        assert_eq!(backend.in_flight.load(Ordering::Acquire), 0);
+        {
+            let _g = backend.ensure_loaded_for_request().await.unwrap();
+            assert_eq!(backend.in_flight.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(backend.in_flight.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_for_request_touches_last_used() {
+        let backend = LlamaBackend::new(
+            &test_config(),
+            crate::engine::scheduling::ResidentSet::new(0),
+            0,
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+        .unwrap();
+        {
+            let (dummy_tx, _rx) = tokio::sync::mpsc::channel(1);
+            let mut guard = backend.load_state.lock().await;
+            *guard = LoadState::Loaded(LoadedState {
+                cmd_tx: dummy_tx,
+                worker_handle: None,
+            });
+        }
+        let before = backend.last_used_ms.load(Ordering::Acquire);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let _g = backend.ensure_loaded_for_request().await.unwrap();
+        let after = backend.last_used_ms.load(Ordering::Acquire);
+        assert!(after > before);
     }
 }
