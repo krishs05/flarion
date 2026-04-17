@@ -2,36 +2,63 @@ mod inference;
 mod protocol;
 mod worker;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use tokio::sync::{mpsc, oneshot};
-use tracing::{info, warn};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use tokio::sync::{mpsc, oneshot, Mutex, Notify, OnceCell};
+use tracing::{info, warn};
 
 use crate::api::types::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse};
 use crate::config::ModelConfig;
-use crate::engine::backend::{InferenceBackend, ModelInfo};
-use crate::engine::scheduling::ResidentSet;
+use crate::engine::backend::{Evictor, InferenceBackend, ModelInfo};
+use crate::engine::scheduling::{ReservationRequest, ResidentSet};
 use crate::error::EngineError;
 
 use inference::LlamaAdapter;
 use protocol::WorkerCommand;
 
+pub(crate) struct LoadedState {
+    cmd_tx: mpsc::Sender<WorkerCommand>,
+    /// Handle to the worker OS thread; joined on shutdown / unload.
+    worker_handle: Option<JoinHandle<()>>,
+}
+
+pub(crate) enum LoadState {
+    Unloaded,
+    Loading(Arc<Notify>),
+    Loaded(LoadedState),
+}
+
 pub struct LlamaBackend {
     config: ModelConfig,
-    cmd_tx_slot: Mutex<Option<mpsc::Sender<WorkerCommand>>>,
     poisoned: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
 
-    // Lazy loading + VRAM budget tracking.
-    #[allow(dead_code)]
-    lazy: bool,
-    load_once: tokio::sync::OnceCell<()>,
     resident_set: Arc<ResidentSet>,
     estimated_vram_mb: u64,
+
+    /// Primary state machine (replaces 2F's OnceCell + cmd_tx_slot).
+    pub(crate) load_state: Mutex<LoadState>,
+    /// Unix millis of most recent request completion or load success.
+    pub(crate) last_used_ms: Arc<AtomicU64>,
+    /// Count of requests currently executing + loading sentinel.
+    pub(crate) in_flight: Arc<AtomicU32>,
+    /// Process-wide mutex serializing load + evict sequences.
+    #[allow(dead_code)]
+    load_coordinator: Arc<Mutex<()>>,
+    /// Late-bound (set after registry construction).
+    #[allow(dead_code)]
+    evictor: OnceCell<Weak<dyn Evictor>>,
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl LlamaBackend {
@@ -39,6 +66,7 @@ impl LlamaBackend {
         config: &ModelConfig,
         resident_set: Arc<ResidentSet>,
         estimated_vram_mb: u64,
+        load_coordinator: Arc<Mutex<()>>,
     ) -> Result<Self, EngineError> {
         if config.path.is_none() {
             return Err(EngineError::ModelLoadFailed(format!(
@@ -48,24 +76,32 @@ impl LlamaBackend {
         }
         Ok(Self {
             config: config.clone(),
-            cmd_tx_slot: Mutex::new(None),
             poisoned: Arc::new(AtomicBool::new(false)),
             draining: Arc::new(AtomicBool::new(false)),
-            lazy: config.lazy,
-            load_once: tokio::sync::OnceCell::new(),
             resident_set,
             estimated_vram_mb,
+            load_state: Mutex::new(LoadState::Unloaded),
+            last_used_ms: Arc::new(AtomicU64::new(0)),
+            in_flight: Arc::new(AtomicU32::new(0)),
+            load_coordinator,
+            evictor: OnceCell::new(),
         })
     }
 
-    /// Spawn the worker OS thread and drive it through the Load command.
-    async fn spawn_worker_and_send_load(&self) -> Result<(), EngineError> {
+    pub(crate) fn touch_last_used(&self) {
+        self.last_used_ms.store(now_unix_ms(), Ordering::Release);
+    }
+
+    /// Spawn the worker OS thread and drive it through Load. Returns the
+    /// populated `LoadedState` on success. Task 14 adds the eviction loop
+    /// around this call.
+    async fn spawn_worker_and_send_load(&self) -> Result<LoadedState, EngineError> {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let config = self.config.clone();
         let poisoned = self.poisoned.clone();
         let thread_name = format!("flarion-llama-{}", self.config.id);
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
                 worker::run(config, cmd_rx, poisoned, LlamaAdapter::default());
@@ -82,51 +118,43 @@ impl LlamaBackend {
             EngineError::ModelLoadFailed("worker thread panicked during Load".into())
         })??;
 
-        *self
-            .cmd_tx_slot
-            .lock()
-            .map_err(|_| EngineError::ModelLoadFailed("cmd_tx lock poisoned".into()))? =
-            Some(cmd_tx);
-        Ok(())
+        Ok(LoadedState {
+            cmd_tx,
+            worker_handle: Some(handle),
+        })
     }
 
-    fn cmd_tx(&self) -> Result<mpsc::Sender<WorkerCommand>, EngineError> {
+    /// Single-flight 2F-compatible ensure_loaded: returns Ok when Loaded,
+    /// otherwise transitions Unloaded → Loading → Loaded. No eviction yet
+    /// (Task 14 adds that to load_as_leader).
+    pub(crate) async fn ensure_loaded(&self) -> Result<(), EngineError> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(EngineError::BackendPoisoned);
         }
         if self.draining.load(Ordering::Acquire) {
             return Err(EngineError::BackendDraining);
         }
-        self.cmd_tx_slot
-            .lock()
-            .map_err(|_| EngineError::InferenceFailed("cmd_tx lock poisoned".into()))?
-            .clone()
-            .ok_or_else(|| {
-                EngineError::InferenceFailed("worker not started (call load first)".into())
-            })
+
+        loop {
+            let notify = {
+                let mut guard = self.load_state.lock().await;
+                match &*guard {
+                    LoadState::Loaded(_) => return Ok(()),
+                    LoadState::Loading(n) => n.clone(),
+                    LoadState::Unloaded => {
+                        let n = Arc::new(Notify::new());
+                        *guard = LoadState::Loading(n.clone());
+                        drop(guard);
+                        return self.load_as_leader(n).await;
+                    }
+                }
+            };
+            notify.notified().await;
+        }
     }
 
-    /// Single-flight lazy load: returns immediately if already loaded,
-    /// otherwise runs `try_load_inner` exactly once across concurrent callers.
-    async fn ensure_loaded(&self) -> Result<(), EngineError> {
-        if self.load_once.initialized() {
-            return Ok(());
-        }
-        if self.poisoned.load(Ordering::Acquire) {
-            return Err(EngineError::BackendPoisoned);
-        }
-        if self.draining.load(Ordering::Acquire) {
-            return Err(EngineError::BackendDraining);
-        }
-        self.load_once
-            .get_or_try_init(|| self.try_load_inner())
-            .await?;
-        Ok(())
-    }
-
-    /// Reserve budget → spawn worker → release on failure.
-    async fn try_load_inner(&self) -> Result<(), EngineError> {
-        use crate::engine::scheduling::ResidentError;
+    async fn load_as_leader(&self, notify: Arc<Notify>) -> Result<(), EngineError> {
+        let _coord = self.load_coordinator.lock().await;
 
         tracing::info!(
             model_id = %self.config.id,
@@ -134,34 +162,27 @@ impl LlamaBackend {
             "lazy load triggered"
         );
 
-        use std::sync::atomic::{AtomicU32, AtomicU64};
-        let last_used_ms = Arc::new(AtomicU64::new(0));
-        let in_flight = Arc::new(AtomicU32::new(0));
-        self.resident_set
-            .try_reserve(crate::engine::scheduling::ReservationRequest {
-                model_id: &self.config.id,
-                cost_mb: self.estimated_vram_mb,
-                pinned: self.config.pin,
-                last_used_ms,
-                in_flight,
-            })
-            .map_err(|e| match e {
+        let req = ReservationRequest {
+            model_id: &self.config.id,
+            cost_mb: self.estimated_vram_mb,
+            pinned: self.config.pin,
+            last_used_ms: self.last_used_ms.clone(),
+            in_flight: self.in_flight.clone(),
+        };
+
+        if let Err(e) = self.resident_set.try_reserve(req) {
+            use crate::engine::scheduling::ResidentError;
+            self.fail_loading(&notify).await;
+            return Err(match e {
                 ResidentError::OverBudget {
-                    model_id,
                     requested_mb,
                     current_mb,
                     budget_mb,
+                    ..
                 } => {
-                    tracing::warn!(
-                        %model_id,
-                        requested_mb,
-                        current_mb,
-                        budget_mb,
-                        "budget exceeded, rejecting load"
-                    );
                     metrics::counter!(
                         "flarion_model_loads_total",
-                        "model" => model_id.clone(),
+                        "model" => self.config.id.clone(),
                         "result" => "over_budget",
                     )
                     .increment(1);
@@ -173,17 +194,17 @@ impl LlamaBackend {
                 ResidentError::Poisoned => {
                     EngineError::InferenceFailed("resident set poisoned".into())
                 }
-            })?;
+            });
+        }
 
-        // Reservation is live now; release it on any spawn/load failure below.
         match self.spawn_worker_and_send_load().await {
-            Ok(()) => {
-                tracing::info!(
-                    model_id = %self.config.id,
-                    total_mb = self.resident_set.total_reserved_mb(),
-                    budget_mb = self.resident_set.budget_mb(),
-                    "reserved VRAM for model"
-                );
+            Ok(loaded) => {
+                {
+                    let mut guard = self.load_state.lock().await;
+                    *guard = LoadState::Loaded(loaded);
+                }
+                notify.notify_waiters();
+                self.touch_last_used();
                 crate::metrics::set_vram_reserved(&self.config.id, self.estimated_vram_mb);
                 metrics::counter!(
                     "flarion_model_loads_total",
@@ -194,13 +215,9 @@ impl LlamaBackend {
                 Ok(())
             }
             Err(e) => {
-                tracing::error!(
-                    model_id = %self.config.id,
-                    error = %e,
-                    "model load failed after reservation; releasing"
-                );
                 self.resident_set.release(&self.config.id);
                 crate::metrics::set_vram_reserved(&self.config.id, 0);
+                self.fail_loading(&notify).await;
                 metrics::counter!(
                     "flarion_model_loads_total",
                     "model" => self.config.id.clone(),
@@ -209,6 +226,31 @@ impl LlamaBackend {
                 .increment(1);
                 Err(e)
             }
+        }
+    }
+
+    async fn fail_loading(&self, notify: &Notify) {
+        let mut guard = self.load_state.lock().await;
+        *guard = LoadState::Unloaded;
+        notify.notify_waiters();
+    }
+
+    /// Snapshot helper for chat_completion paths: clones the current cmd_tx
+    /// if Loaded. Does NOT bump `in_flight` (Task 12 adds a request-path
+    /// wrapper that does so atomically).
+    async fn cmd_tx(&self) -> Result<mpsc::Sender<WorkerCommand>, EngineError> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(EngineError::BackendPoisoned);
+        }
+        if self.draining.load(Ordering::Acquire) {
+            return Err(EngineError::BackendDraining);
+        }
+        let guard = self.load_state.lock().await;
+        match &*guard {
+            LoadState::Loaded(loaded) => Ok(loaded.cmd_tx.clone()),
+            LoadState::Loading(_) | LoadState::Unloaded => Err(EngineError::InferenceFailed(
+                "worker not ready (ensure_loaded should run first)".into(),
+            )),
         }
     }
 }
@@ -224,7 +266,7 @@ impl InferenceBackend for LlamaBackend {
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, EngineError> {
         self.ensure_loaded().await?;
-        let cmd_tx = self.cmd_tx()?;
+        let cmd_tx = self.cmd_tx().await?;
         let (ack_tx, ack_rx) = oneshot::channel();
         cmd_tx
             .send(WorkerCommand::Chat {
@@ -242,7 +284,7 @@ impl InferenceBackend for LlamaBackend {
         tx: mpsc::Sender<ChatCompletionChunk>,
     ) -> Result<(), EngineError> {
         self.ensure_loaded().await?;
-        let cmd_tx = self.cmd_tx()?;
+        let cmd_tx = self.cmd_tx().await?;
         let (done_tx, done_rx) = oneshot::channel();
         cmd_tx
             .send(WorkerCommand::ChatStream {
@@ -256,12 +298,13 @@ impl InferenceBackend for LlamaBackend {
     }
 
     fn model_info(&self) -> ModelInfo {
-        let loaded = !self.poisoned.load(Ordering::Acquire)
-            && self
-                .cmd_tx_slot
-                .lock()
-                .map(|g| g.is_some())
-                .unwrap_or(false);
+        let loaded = !self.poisoned.load(Ordering::Acquire) && {
+            // try_lock keeps model_info non-blocking.
+            match self.load_state.try_lock() {
+                Ok(g) => matches!(&*g, LoadState::Loaded(_)),
+                Err(_) => false, // contended; report not-loaded
+            }
+        };
         ModelInfo {
             id: self.config.id.clone(),
             context_size: self.config.context_size,
@@ -279,26 +322,26 @@ impl InferenceBackend for LlamaBackend {
     }
 
     async fn shutdown(&self, grace: Duration) {
-        if !self.load_once.initialized() {
-            return;
-        }
-
         self.draining.store(true, Ordering::Release);
-        let cmd_tx = match self.cmd_tx_slot.lock() {
-            Ok(mut g) => g.take(),
-            Err(_) => return,
+        let loaded = {
+            let mut guard = self.load_state.lock().await;
+            match std::mem::replace(&mut *guard, LoadState::Unloaded) {
+                LoadState::Loaded(l) => Some(l),
+                _ => None,
+            }
         };
-        let Some(cmd_tx) = cmd_tx else { return };
+        let Some(mut loaded) = loaded else { return };
 
         let (ack_tx, ack_rx) = oneshot::channel();
-        if cmd_tx
-            .send(protocol::WorkerCommand::Shutdown { ack: ack_tx })
+        if loaded
+            .cmd_tx
+            .send(WorkerCommand::Shutdown { ack: ack_tx })
             .await
             .is_err()
         {
             return;
         }
-        drop(cmd_tx);
+        drop(loaded.cmd_tx);
 
         match tokio::time::timeout(grace, ack_rx).await {
             Ok(Ok(())) => info!(model_id = %self.config.id, "drained cleanly"),
@@ -311,6 +354,10 @@ impl InferenceBackend for LlamaBackend {
                 grace_secs = grace.as_secs(),
                 "shutdown grace exceeded; abandoning worker"
             ),
+        }
+
+        if let Some(handle) = loaded.worker_handle.take() {
+            let _ = tokio::task::spawn_blocking(move || handle.join()).await;
         }
 
         self.resident_set.release(&self.config.id);
@@ -369,6 +416,7 @@ mod tests {
             &test_config(),
             crate::engine::scheduling::ResidentSet::new(0),
             0,
+            Arc::new(tokio::sync::Mutex::new(())),
         )
         .unwrap();
         backend.poisoned.store(true, Ordering::Release);
@@ -383,6 +431,7 @@ mod tests {
             &test_config(),
             crate::engine::scheduling::ResidentSet::new(0),
             0,
+            Arc::new(tokio::sync::Mutex::new(())),
         )
         .unwrap();
         backend.draining.store(true, Ordering::Release);
@@ -399,6 +448,7 @@ mod tests {
             &test_config(),
             crate::engine::scheduling::ResidentSet::new(0),
             0,
+            Arc::new(tokio::sync::Mutex::new(())),
         )
         .unwrap();
         let err = backend.chat_completion(test_request()).await.unwrap_err();
@@ -412,7 +462,12 @@ mod tests {
     fn backend_new_rejects_missing_path() {
         let mut cfg = test_config();
         cfg.path = None;
-        match LlamaBackend::new(&cfg, crate::engine::scheduling::ResidentSet::new(0), 0) {
+        match LlamaBackend::new(
+            &cfg,
+            crate::engine::scheduling::ResidentSet::new(0),
+            0,
+            Arc::new(tokio::sync::Mutex::new(())),
+        ) {
             Err(EngineError::ModelLoadFailed(_)) => {}
             Err(other) => panic!("expected ModelLoadFailed, got {other:?}"),
             Ok(_) => panic!("expected error, got Ok"),
@@ -425,6 +480,7 @@ mod tests {
             &test_config(),
             crate::engine::scheduling::ResidentSet::new(0),
             0,
+            Arc::new(tokio::sync::Mutex::new(())),
         )
         .unwrap();
         assert!(!backend.model_info().loaded);
@@ -432,21 +488,26 @@ mod tests {
         assert!(!backend.model_info().loaded);
     }
 
-    #[test]
-    fn lazy_backend_does_not_load_on_new() {
+    #[tokio::test]
+    async fn lazy_backend_does_not_load_on_new() {
         let mut cfg = test_config();
         cfg.lazy = true;
         let resident_set = crate::engine::scheduling::ResidentSet::new(0);
-        let backend = LlamaBackend::new(&cfg, resident_set, 0).unwrap();
-        assert!(!backend.load_once.initialized());
-        assert!(backend.cmd_tx_slot.lock().unwrap().is_none());
+        let backend = LlamaBackend::new(
+            &cfg,
+            resident_set,
+            0,
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+        .unwrap();
+        let state = backend.load_state.lock().await;
+        assert!(matches!(&*state, LoadState::Unloaded));
     }
 
     #[tokio::test]
     async fn ensure_loaded_returns_over_budget_when_resident_set_full() {
         let cfg = test_config();
         let resident_set = crate::engine::scheduling::ResidentSet::new(1000);
-        use std::sync::atomic::{AtomicU32, AtomicU64};
         resident_set
             .try_reserve(crate::engine::scheduling::ReservationRequest {
                 model_id: "other",
@@ -456,20 +517,32 @@ mod tests {
                 in_flight: std::sync::Arc::new(AtomicU32::new(0)),
             })
             .unwrap();
-        let backend = LlamaBackend::new(&cfg, resident_set, 500).unwrap();
+        let backend = LlamaBackend::new(
+            &cfg,
+            resident_set,
+            500,
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+        .unwrap();
         let err = backend.ensure_loaded().await.unwrap_err();
         assert!(matches!(err, EngineError::ModelUnavailable(_)));
-        // OnceCell must stay uninitialized so a later retry can succeed, and
+        // State must return to Unloaded so a later retry can succeed, and
         // no worker should have been spawned before the reservation failed.
-        assert!(!backend.load_once.initialized());
-        assert!(backend.cmd_tx_slot.lock().unwrap().is_none());
+        let state = backend.load_state.lock().await;
+        assert!(matches!(&*state, LoadState::Unloaded));
     }
 
     #[tokio::test]
     async fn ensure_loaded_returns_draining_error() {
         let cfg = test_config();
         let resident_set = crate::engine::scheduling::ResidentSet::new(0);
-        let backend = LlamaBackend::new(&cfg, resident_set, 0).unwrap();
+        let backend = LlamaBackend::new(
+            &cfg,
+            resident_set,
+            0,
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+        .unwrap();
         backend.draining.store(true, Ordering::Release);
         let err = backend.ensure_loaded().await.unwrap_err();
         assert!(matches!(err, EngineError::BackendDraining));
@@ -479,9 +552,44 @@ mod tests {
     async fn ensure_loaded_returns_poisoned_error() {
         let cfg = test_config();
         let resident_set = crate::engine::scheduling::ResidentSet::new(0);
-        let backend = LlamaBackend::new(&cfg, resident_set, 0).unwrap();
+        let backend = LlamaBackend::new(
+            &cfg,
+            resident_set,
+            0,
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+        .unwrap();
         backend.poisoned.store(true, Ordering::Release);
         let err = backend.ensure_loaded().await.unwrap_err();
         assert!(matches!(err, EngineError::BackendPoisoned));
+    }
+
+    #[tokio::test]
+    async fn backend_state_starts_unloaded() {
+        let backend = LlamaBackend::new(
+            &test_config(),
+            crate::engine::scheduling::ResidentSet::new(0),
+            0,
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+        .unwrap();
+        let state = backend.load_state.lock().await;
+        assert!(matches!(&*state, LoadState::Unloaded));
+    }
+
+    #[tokio::test]
+    async fn backend_touch_last_used_updates_timestamp() {
+        let backend = LlamaBackend::new(
+            &test_config(),
+            crate::engine::scheduling::ResidentSet::new(0),
+            0,
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+        .unwrap();
+        let before = backend.last_used_ms.load(std::sync::atomic::Ordering::Acquire);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        backend.touch_last_used();
+        let after = backend.last_used_ms.load(std::sync::atomic::Ordering::Acquire);
+        assert!(after > before, "before={before} after={after}");
     }
 }

@@ -80,9 +80,12 @@ async fn main() -> anyhow::Result<()> {
     let resident_set = flarion::engine::scheduling::ResidentSet::new(budget_mb);
     flarion::metrics::set_vram_budget(budget_mb);
 
+    let load_coordinator: Arc<tokio::sync::Mutex<()>> =
+        Arc::new(tokio::sync::Mutex::new(()));
+
     let mut registry = BackendRegistry::new();
     for model_cfg in &config.models {
-        match load_backend(model_cfg, resident_set.clone()).await {
+        match load_backend(model_cfg, resident_set.clone(), load_coordinator.clone()).await {
             Ok(backend) => {
                 tracing::info!(model_id = %model_cfg.id, "model loaded successfully");
                 registry.insert(model_cfg.id.clone(), backend);
@@ -209,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
 async fn load_backend(
     cfg: &ModelConfig,
     resident_set: std::sync::Arc<flarion::engine::scheduling::ResidentSet>,
+    load_coordinator: std::sync::Arc<tokio::sync::Mutex<()>>,
 ) -> anyhow::Result<Arc<dyn InferenceBackend>> {
     match cfg.backend {
         BackendType::Local => {
@@ -218,7 +222,7 @@ async fn load_backend(
                 .expect("local backend path must be set — earlier validation ensures this");
             let estimated_mb = flarion::engine::scheduling::estimate_vram_mb(path, cfg.vram_mb)
                 .map_err(|e| anyhow::anyhow!("VRAM estimation failed for '{}': {e}", cfg.id))?;
-            let backend = LlamaBackend::new(cfg, resident_set, estimated_mb)?;
+            let backend = LlamaBackend::new(cfg, resident_set, estimated_mb, load_coordinator)?;
             if !cfg.lazy {
                 backend.load().await?;
             } else {
