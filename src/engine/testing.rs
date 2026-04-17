@@ -184,6 +184,7 @@ impl MockBackend {
             EngineError::BackendPoisoned => EngineError::BackendPoisoned,
             EngineError::BackendDraining => EngineError::BackendDraining,
             EngineError::ModelUnavailable(msg) => EngineError::ModelUnavailable(msg.clone()),
+            EngineError::BackendBusy => EngineError::BackendBusy,
         }
     }
 }

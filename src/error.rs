@@ -41,6 +41,9 @@ pub enum EngineError {
 
     #[error("model unavailable: {0}")]
     ModelUnavailable(String),
+
+    #[error("backend busy (in-flight request prevents eviction/unload)")]
+    BackendBusy,
 }
 
 #[allow(dead_code)]
@@ -137,6 +140,10 @@ impl From<EngineError> for ApiError {
             EngineError::ModelUnavailable(detail) => {
                 tracing::warn!(%detail, "request rejected: model unavailable");
                 ApiError::ServiceUnavailable("model temporarily unavailable".into())
+            }
+            EngineError::BackendBusy => {
+                tracing::warn!("backend busy, rejecting request");
+                ApiError::ServiceUnavailable("backend busy".into())
             }
         }
     }
@@ -376,5 +383,20 @@ mod tests {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(s.contains("model temporarily unavailable"));
+    }
+
+    #[test]
+    fn test_backend_busy_is_not_retryable_at_outer_layer() {
+        // BackendBusy is an internal signal for the eviction driver; it never
+        // propagates to clients directly. If it ever leaks, is_retryable=false
+        // is the safer default.
+        assert!(!is_retryable(&EngineError::BackendBusy));
+    }
+
+    #[tokio::test]
+    async fn test_backend_busy_maps_to_503_body() {
+        let api_err: ApiError = EngineError::BackendBusy.into();
+        let resp = api_err.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
     }
 }
