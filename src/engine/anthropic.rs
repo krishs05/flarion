@@ -663,6 +663,7 @@ mod tests {
             max_tokens_cap: None,
             lazy: false,
             vram_mb: None,
+            pin: false,
         };
         let backend = AnthropicBackend::new(&cfg).unwrap();
         assert_eq!(backend.endpoint(), "https://api.anthropic.com/v1/messages");
@@ -686,6 +687,7 @@ mod tests {
             max_tokens_cap: None,
             lazy: false,
             vram_mb: None,
+            pin: false,
         };
         let backend = AnthropicBackend::new(&cfg).unwrap();
         assert_eq!(backend.provider(), "anthropic");

@@ -334,6 +334,7 @@ mod tests {
             max_tokens_cap: None,
             lazy: false,
             vram_mb: None,
+            pin: false,
         }
     }
 

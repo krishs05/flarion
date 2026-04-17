@@ -211,6 +211,11 @@ pub struct ModelConfig {
     /// `vram_budget_mb` is set; local backends only.
     #[serde(default)]
     pub vram_mb: Option<u64>,
+
+    /// Never evict this model from VRAM under budget pressure. Local backends
+    /// only. Pinned models count against `vram_budget_mb` at startup.
+    #[serde(default)]
+    pub pin: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
@@ -520,6 +525,12 @@ impl FlarionConfig {
                     backend: m.backend.clone(),
                 });
             }
+            if m.pin && m.backend != BackendType::Local {
+                return Err(ConfigError::PinOnlyForLocal {
+                    id: m.id.clone(),
+                    backend: m.backend.clone(),
+                });
+            }
         }
 
         // Eager local models only — lazy models may not all be resident.
@@ -748,6 +759,11 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error(
+        "model '{id}' has pin=true but backend={backend:?}; pin is only supported for local backends"
+    )]
+    PinOnlyForLocal { id: String, backend: BackendType },
 }
 
 #[cfg(test)]
@@ -771,6 +787,7 @@ mod tests {
             max_tokens_cap: None,
             lazy: false,
             vram_mb: None,
+            pin: false,
         }
     }
 
@@ -791,6 +808,7 @@ mod tests {
             max_tokens_cap: None,
             lazy: false,
             vram_mb: None,
+            pin: false,
         }
     }
 
@@ -1083,6 +1101,7 @@ path = "/tmp/x.gguf"
                 max_tokens_cap: None,
                 lazy: false,
                 vram_mb: None,
+                pin: false,
             }],
             logging: LoggingConfig::default(),
             ..FlarionConfig::default()
@@ -2083,6 +2102,7 @@ vram_mb = 6000
             max_tokens_cap: None,
             lazy: true,
             vram_mb: None,
+            pin: false,
         }];
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::LazyOnlyForLocal { .. }));
@@ -2108,6 +2128,7 @@ vram_mb = 6000
             max_tokens_cap: None,
             lazy: false,
             vram_mb: Some(1000),
+            pin: false,
         }];
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::VramMbOnlyForLocal { .. }));
@@ -2171,5 +2192,63 @@ vram_mb = 6000
         cfg.models = vec![local_cfg("eager", a_path), lazy_model];
         // Eager: 240MB < 300MB budget. Lazy excluded from sum.
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn test_pin_deserializes_default_false() {
+        let toml = r#"
+        [server]
+        host = "127.0.0.1"
+        [[models]]
+        id = "m"
+        backend = "local"
+        path = "/tmp/m.gguf"
+    "#;
+        let cfg: FlarionConfig = toml::from_str(toml).unwrap();
+        assert!(!cfg.models[0].pin);
+    }
+
+    #[test]
+    fn test_pin_deserializes_true() {
+        let toml = r#"
+        [server]
+        host = "127.0.0.1"
+        [[models]]
+        id = "m"
+        backend = "local"
+        path = "/tmp/m.gguf"
+        pin = true
+    "#;
+        let cfg: FlarionConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.models[0].pin);
+    }
+
+    #[test]
+    fn test_validate_rejects_pin_on_cloud_backend() {
+        let mut cfg = FlarionConfig::default();
+        cfg.server.host = "127.0.0.1".into();
+        cfg.models = vec![ModelConfig {
+            id: "openai-m".into(),
+            backend: BackendType::Openai,
+            path: None,
+            context_size: 4096,
+            gpu_layers: 99,
+            threads: None,
+            batch_size: None,
+            seed: None,
+            api_key: Some("k".into()),
+            base_url: Some("https://api.openai.com/v1".into()),
+            upstream_model: Some("gpt-4o".into()),
+            timeout_secs: None,
+            max_tokens_cap: None,
+            lazy: false,
+            vram_mb: None,
+            pin: true,
+        }];
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::PinOnlyForLocal { .. }),
+            "got {err:?}"
+        );
     }
 }

@@ -35,6 +35,7 @@ fn local_model(id: &str, path: PathBuf, lazy: bool) -> ModelConfig {
         max_tokens_cap: None,
         lazy,
         vram_mb: None,
+        pin: false,
     }
 }
 
