@@ -54,9 +54,10 @@ pub fn is_retryable(err: &EngineError) -> bool {
             | EngineError::Network(_)
             | EngineError::UpstreamServerError { .. }
             | EngineError::RateLimited { .. }
+            | EngineError::ModelUnavailable(_)  // new in 2G — eviction makes retry meaningful
     )
-    // BackendPoisoned / BackendDraining: not retryable (restart / shutdown).
-    // ModelUnavailable: not retryable without eviction / capacity changes.
+    // BackendPoisoned / BackendDraining / BackendBusy: not retryable by clients
+    // (BackendBusy is an internal eviction-driver signal that should not leak).
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -72,8 +73,11 @@ pub enum ApiError {
     Internal(String),
     #[error("{0}")]
     BadGateway(String),
-    #[error("service unavailable: {0}")]
-    ServiceUnavailable(String),
+    #[error("service unavailable: {message}")]
+    ServiceUnavailable {
+        message: String,
+        retry_after_secs: Option<u32>,
+    },
 }
 
 fn format_model_not_found(requested: &str, available: &[String]) -> String {
@@ -131,19 +135,31 @@ impl From<EngineError> for ApiError {
             }
             EngineError::BackendPoisoned => {
                 tracing::error!("backend poisoned, rejecting request");
-                ApiError::ServiceUnavailable("model backend temporarily unavailable".into())
+                ApiError::ServiceUnavailable {
+                    message: "model backend temporarily unavailable".into(),
+                    retry_after_secs: None,
+                }
             }
             EngineError::BackendDraining => {
                 tracing::warn!("backend draining, rejecting request");
-                ApiError::ServiceUnavailable("server shutting down".into())
+                ApiError::ServiceUnavailable {
+                    message: "server shutting down".into(),
+                    retry_after_secs: None,
+                }
             }
             EngineError::ModelUnavailable(detail) => {
                 tracing::warn!(%detail, "request rejected: model unavailable");
-                ApiError::ServiceUnavailable("model temporarily unavailable".into())
+                ApiError::ServiceUnavailable {
+                    message: "model temporarily unavailable, retry shortly".into(),
+                    retry_after_secs: Some(5),
+                }
             }
             EngineError::BackendBusy => {
                 tracing::warn!("backend busy, rejecting request");
-                ApiError::ServiceUnavailable("backend busy".into())
+                ApiError::ServiceUnavailable {
+                    message: "backend busy".into(),
+                    retry_after_secs: Some(1),
+                }
             }
         }
     }
@@ -151,27 +167,31 @@ impl From<EngineError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, error_type, code) = match &self {
+        let (status, error_type, code, retry_after) = match &self {
             ApiError::BadRequest(_) => (
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
                 "bad_request",
+                None,
             ),
             ApiError::ModelNotFound { .. } => (
                 StatusCode::NOT_FOUND,
                 "invalid_request_error",
                 "model_not_found",
+                None,
             ),
             ApiError::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
                 "internal_error",
+                None,
             ),
-            ApiError::BadGateway(_) => (StatusCode::BAD_GATEWAY, "server_error", "upstream_error"),
-            ApiError::ServiceUnavailable(_) => (
+            ApiError::BadGateway(_) => (StatusCode::BAD_GATEWAY, "server_error", "upstream_error", None),
+            ApiError::ServiceUnavailable { retry_after_secs, .. } => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "server_error",
                 "service_unavailable",
+                *retry_after_secs,
             ),
         };
 
@@ -183,7 +203,14 @@ impl IntoResponse for ApiError {
             }
         });
 
-        (status, Json(body)).into_response()
+        let mut resp = (status, Json(body)).into_response();
+        if let Some(secs) = retry_after
+            && let Ok(v) = axum::http::HeaderValue::from_str(&secs.to_string())
+        {
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, v);
+        }
+        resp
     }
 }
 
@@ -368,13 +395,6 @@ mod tests {
         assert!(s.contains("server shutting down"));
     }
 
-    #[test]
-    fn test_model_unavailable_is_not_retryable() {
-        assert!(!is_retryable(&EngineError::ModelUnavailable(
-            "budget".into()
-        )));
-    }
-
     #[tokio::test]
     async fn test_model_unavailable_maps_to_503_body() {
         let api_err: ApiError = EngineError::ModelUnavailable("budget exceeded".into()).into();
@@ -398,5 +418,29 @@ mod tests {
         let api_err: ApiError = EngineError::BackendBusy.into();
         let resp = api_err.into_response();
         assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn test_model_unavailable_is_retryable_in_2g() {
+        assert!(is_retryable(&EngineError::ModelUnavailable("x".into())));
+    }
+
+    #[tokio::test]
+    async fn test_model_unavailable_emits_retry_after_header() {
+        let api_err: ApiError = EngineError::ModelUnavailable("budget exceeded".into()).into();
+        let resp = api_err.into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let hdr = resp
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("Retry-After header missing");
+        assert_eq!(hdr.to_str().unwrap(), "5");
+    }
+
+    #[tokio::test]
+    async fn test_backend_poisoned_has_no_retry_after_header() {
+        let api_err: ApiError = EngineError::BackendPoisoned.into();
+        let resp = api_err.into_response();
+        assert!(resp.headers().get(axum::http::header::RETRY_AFTER).is_none());
     }
 }
