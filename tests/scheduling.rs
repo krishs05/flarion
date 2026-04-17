@@ -127,3 +127,111 @@ fn overbudget_eager_config_fails_validation() {
         "got: {err}"
     );
 }
+
+#[test]
+fn pick_eviction_candidates_excludes_pinned_across_integration() {
+    let set = ResidentSet::new(10_000);
+    set.try_reserve(ReservationRequest {
+        model_id: "pinned",
+        cost_mb: 5000,
+        pinned: true,
+        last_used_ms: Arc::new(AtomicU64::new(100)),
+        in_flight: Arc::new(AtomicU32::new(0)),
+    })
+    .unwrap();
+    set.try_reserve(ReservationRequest {
+        model_id: "unpinned",
+        cost_mb: 4000,
+        pinned: false,
+        last_used_ms: Arc::new(AtomicU64::new(500)),
+        in_flight: Arc::new(AtomicU32::new(0)),
+    })
+    .unwrap();
+    // Need 3000; pinned is older but must not be chosen.
+    let victims = set.pick_eviction_candidates(3000).unwrap();
+    assert_eq!(victims, vec!["unpinned".to_string()]);
+}
+
+#[test]
+fn pick_eviction_candidates_respects_budget_when_all_busy() {
+    let set = ResidentSet::new(10_000);
+    set.try_reserve(ReservationRequest {
+        model_id: "a",
+        cost_mb: 5000,
+        pinned: false,
+        last_used_ms: Arc::new(AtomicU64::new(100)),
+        in_flight: Arc::new(AtomicU32::new(1)), // busy
+    })
+    .unwrap();
+    assert!(set.pick_eviction_candidates(5000).is_none());
+}
+
+#[test]
+fn overbudget_pinned_config_fails_validation() {
+    use flarion::config::{BackendType, FlarionConfig, ModelConfig};
+    use std::path::PathBuf;
+
+    let dir = tempfile::tempdir().unwrap();
+    let p = |n: &str| {
+        let path = dir.path().join(n);
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(300 * 1024 * 1024).unwrap();
+        drop(f);
+        path
+    };
+
+    fn lazy_pinned(id: &str, path: PathBuf) -> ModelConfig {
+        ModelConfig {
+            id: id.into(),
+            backend: BackendType::Local,
+            path: Some(path),
+            context_size: 4096,
+            gpu_layers: 99,
+            threads: None,
+            batch_size: None,
+            seed: None,
+            api_key: None,
+            base_url: None,
+            upstream_model: None,
+            timeout_secs: None,
+            max_tokens_cap: None,
+            lazy: true,
+            vram_mb: None,
+            pin: true,
+        }
+    }
+
+    let mut cfg = FlarionConfig::default();
+    cfg.server.host = "127.0.0.1".into();
+    cfg.server.vram_budget_mb = VramBudgetSetting::Fixed(500);
+    cfg.models = vec![
+        lazy_pinned("a", p("a.gguf")),
+        lazy_pinned("b", p("b.gguf")),
+    ];
+    let err = cfg.validate().unwrap_err();
+    assert!(
+        format!("{err}").contains("pinned local models total"),
+        "got {err}"
+    );
+}
+
+#[tokio::test]
+async fn evictor_trait_dispatches_to_backend_unload() {
+    // Verifies BackendRegistry::unload calls through to the matched backend.
+    use flarion::engine::backend::{Evictor, InferenceBackend};
+    use flarion::engine::registry::BackendRegistry;
+    use flarion::engine::testing::MockBackend;
+
+    let mut registry = BackendRegistry::new();
+    registry.insert(
+        "m".into(),
+        Arc::new(MockBackend::succeeding("m", "hi")) as Arc<dyn InferenceBackend>,
+    );
+    let registry = Arc::new(registry);
+    // MockBackend uses the default no-op unload, which returns Ok.
+    registry.unload("m").await.unwrap();
+
+    // Unknown model → ModelNotFound.
+    let err = registry.unload("nope").await.unwrap_err();
+    assert!(matches!(err, flarion::error::EngineError::ModelNotFound(_)));
+}
