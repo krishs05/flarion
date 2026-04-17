@@ -162,39 +162,15 @@ impl LlamaBackend {
             "lazy load triggered"
         );
 
-        let req = ReservationRequest {
-            model_id: &self.config.id,
-            cost_mb: self.estimated_vram_mb,
-            pinned: self.config.pin,
-            last_used_ms: self.last_used_ms.clone(),
-            in_flight: self.in_flight.clone(),
-        };
-
-        if let Err(e) = self.resident_set.try_reserve(req) {
-            use crate::engine::scheduling::ResidentError;
+        if let Err(e) = self.try_reserve_with_eviction().await {
             self.fail_loading(&notify).await;
-            return Err(match e {
-                ResidentError::OverBudget {
-                    requested_mb,
-                    current_mb,
-                    budget_mb,
-                    ..
-                } => {
-                    metrics::counter!(
-                        "flarion_model_loads_total",
-                        "model" => self.config.id.clone(),
-                        "result" => "over_budget",
-                    )
-                    .increment(1);
-                    EngineError::ModelUnavailable(format!(
-                        "VRAM budget exceeded: need {requested_mb}MB, have {} free of {budget_mb}MB",
-                        budget_mb.saturating_sub(current_mb)
-                    ))
-                }
-                ResidentError::Poisoned => {
-                    EngineError::InferenceFailed("resident set poisoned".into())
-                }
-            });
+            metrics::counter!(
+                "flarion_model_loads_total",
+                "model" => self.config.id.clone(),
+                "result" => "over_budget",
+            )
+            .increment(1);
+            return Err(e);
         }
 
         match self.spawn_worker_and_send_load().await {
@@ -225,6 +201,76 @@ impl LlamaBackend {
                 )
                 .increment(1);
                 Err(e)
+            }
+        }
+    }
+
+    /// Reserve `estimated_vram_mb` for `self.config.id`, evicting LRU
+    /// victims as necessary. Returns Ok with the reservation held; caller
+    /// must either `spawn_worker_and_send_load` or `release` on failure.
+    pub(crate) async fn try_reserve_with_eviction(&self) -> Result<(), EngineError> {
+        use crate::engine::scheduling::ResidentError;
+        loop {
+            let req = ReservationRequest {
+                model_id: &self.config.id,
+                cost_mb: self.estimated_vram_mb,
+                pinned: self.config.pin,
+                last_used_ms: self.last_used_ms.clone(),
+                in_flight: self.in_flight.clone(),
+            };
+            match self.resident_set.try_reserve(req) {
+                Ok(()) => return Ok(()),
+                Err(ResidentError::OverBudget {
+                    requested_mb,
+                    current_mb,
+                    budget_mb,
+                    ..
+                }) => {
+                    let Some(victims) =
+                        self.resident_set.pick_eviction_candidates(self.estimated_vram_mb)
+                    else {
+                        return Err(EngineError::ModelUnavailable(format!(
+                            "VRAM budget exceeded: need {requested_mb}MB, have {} free of {budget_mb}MB, no eviction candidates available",
+                            budget_mb.saturating_sub(current_mb)
+                        )));
+                    };
+
+                    let Some(evictor) = self.evictor.get().and_then(|w| w.upgrade()) else {
+                        return Err(EngineError::ModelUnavailable(
+                            "no evictor bound; cannot free VRAM".into(),
+                        ));
+                    };
+
+                    let mut any_evicted = false;
+                    for v in victims {
+                        match evictor.unload(&v).await {
+                            Ok(()) => {
+                                self.resident_set.release(&v);
+                                crate::metrics::set_vram_reserved(&v, 0);
+                                metrics::counter!(
+                                    "flarion_model_evictions_total",
+                                    "model" => v.clone(),
+                                    "reason" => "lru",
+                                )
+                                .increment(1);
+                                tracing::info!(victim_model_id = %v, "evicted model to free VRAM");
+                                any_evicted = true;
+                            }
+                            Err(EngineError::BackendBusy) => continue,
+                            Err(e) => return Err(e),
+                        }
+                    }
+
+                    if !any_evicted {
+                        return Err(EngineError::ModelUnavailable(
+                            "all eviction candidates busy; retry shortly".into(),
+                        ));
+                    }
+                    // loop back — retry try_reserve
+                }
+                Err(ResidentError::Poisoned) => {
+                    return Err(EngineError::InferenceFailed("resident set poisoned".into()));
+                }
             }
         }
     }
@@ -401,6 +447,10 @@ impl InferenceBackend for LlamaBackend {
 
     fn max_tokens_cap(&self) -> u32 {
         self.config.max_tokens_cap.unwrap_or(8192)
+    }
+
+    async fn bind_evictor(&self, evictor: Weak<dyn Evictor>) {
+        let _ = self.evictor.set(evictor);
     }
 
     async fn unload(&self) -> Result<(), EngineError> {
@@ -828,5 +878,59 @@ mod tests {
         // State should still be Loaded.
         let state = backend.load_state.lock().await;
         assert!(matches!(&*state, LoadState::Loaded(_)));
+    }
+
+    #[tokio::test]
+    async fn eviction_loop_unloads_lru_victim_and_releases_budget() {
+        use crate::engine::backend::Evictor;
+
+        // A stub evictor that records calls. The real driver in
+        // load_as_leader calls resident_set.release AFTER evictor.unload
+        // returns Ok, so this stub does NOT release itself — it only
+        // records the call and lets try_reserve_with_eviction do the rest.
+        struct StubEvictor {
+            calls: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl Evictor for StubEvictor {
+            async fn unload(&self, id: &str) -> Result<(), EngineError> {
+                self.calls.lock().unwrap().push(id.to_string());
+                Ok(())
+            }
+        }
+
+        let resident_set = crate::engine::scheduling::ResidentSet::new(1000);
+        resident_set
+            .try_reserve(ReservationRequest {
+                model_id: "old",
+                cost_mb: 800,
+                pinned: false,
+                last_used_ms: Arc::new(AtomicU64::new(100)),
+                in_flight: Arc::new(AtomicU32::new(0)),
+            })
+            .unwrap();
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stub: Arc<dyn Evictor> = Arc::new(StubEvictor { calls: calls.clone() });
+        let weak = Arc::downgrade(&stub);
+
+        let mut cfg = test_config();
+        cfg.lazy = true;
+        let backend = LlamaBackend::new(
+            &cfg,
+            resident_set.clone(),
+            600, // needs 600 MB, only 200 MB free → must evict "old"
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+        .unwrap();
+        backend.bind_evictor(weak).await;
+
+        // Drive the reservation+eviction helper directly. We do NOT call
+        // ensure_loaded (which would proceed to spawn_worker_and_send_load
+        // and fail on the missing GGUF). This isolates the eviction logic.
+        let result = backend.try_reserve_with_eviction().await;
+        assert!(result.is_ok(), "reservation failed: {result:?}");
+        assert_eq!(calls.lock().unwrap().as_slice(), &["old".to_string()]);
+        assert_eq!(resident_set.total_reserved_mb(), 600);
     }
 }
