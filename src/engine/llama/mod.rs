@@ -47,10 +47,8 @@ pub struct LlamaBackend {
     /// Count of requests currently executing + loading sentinel.
     pub(crate) in_flight: Arc<AtomicU32>,
     /// Process-wide mutex serializing load + evict sequences.
-    #[allow(dead_code)]
     load_coordinator: Arc<Mutex<()>>,
     /// Late-bound (set after registry construction).
-    #[allow(dead_code)]
     evictor: OnceCell<Weak<dyn Evictor>>,
 }
 
@@ -245,8 +243,6 @@ impl LlamaBackend {
                     for v in victims {
                         match evictor.unload(&v).await {
                             Ok(()) => {
-                                self.resident_set.release(&v);
-                                crate::metrics::set_vram_reserved(&v, 0);
                                 metrics::counter!(
                                     "flarion_model_evictions_total",
                                     "model" => v.clone(),
@@ -884,17 +880,19 @@ mod tests {
     async fn eviction_loop_unloads_lru_victim_and_releases_budget() {
         use crate::engine::backend::Evictor;
 
-        // A stub evictor that records calls. The real driver in
-        // load_as_leader calls resident_set.release AFTER evictor.unload
-        // returns Ok, so this stub does NOT release itself — it only
-        // records the call and lets try_reserve_with_eviction do the rest.
+        // A stub evictor that records calls and releases the reservation,
+        // mirroring what the real LlamaBackend::unload does (it is the sole
+        // authority for calling resident_set.release on a successful unload).
         struct StubEvictor {
             calls: Arc<std::sync::Mutex<Vec<String>>>,
+            resident_set: Arc<crate::engine::scheduling::ResidentSet>,
         }
         #[async_trait]
         impl Evictor for StubEvictor {
             async fn unload(&self, id: &str) -> Result<(), EngineError> {
                 self.calls.lock().unwrap().push(id.to_string());
+                self.resident_set.release(id);
+                crate::metrics::set_vram_reserved(id, 0);
                 Ok(())
             }
         }
@@ -911,7 +909,10 @@ mod tests {
             .unwrap();
 
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let stub: Arc<dyn Evictor> = Arc::new(StubEvictor { calls: calls.clone() });
+        let stub: Arc<dyn Evictor> = Arc::new(StubEvictor {
+            calls: calls.clone(),
+            resident_set: resident_set.clone(),
+        });
         let weak = Arc::downgrade(&stub);
 
         let mut cfg = test_config();

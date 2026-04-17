@@ -46,7 +46,6 @@ pub enum EngineError {
     BackendBusy,
 }
 
-#[allow(dead_code)]
 pub fn is_retryable(err: &EngineError) -> bool {
     matches!(
         err,
