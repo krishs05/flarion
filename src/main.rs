@@ -70,8 +70,15 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let resident_set = flarion::engine::scheduling::ResidentSet::new(config.server.vram_budget_mb);
-    flarion::metrics::set_vram_budget(config.server.vram_budget_mb);
+    let budget_mb = match config.server.vram_budget_mb {
+        flarion::config::VramBudgetSetting::Fixed(n) => n,
+        flarion::config::VramBudgetSetting::Auto => {
+            tracing::error!("vram_budget_mb = \"auto\" requires Phase 2G NVML resolution (not yet wired)");
+            std::process::exit(1);
+        }
+    };
+    let resident_set = flarion::engine::scheduling::ResidentSet::new(budget_mb);
+    flarion::metrics::set_vram_budget(budget_mb);
 
     let mut registry = BackendRegistry::new();
     for model_cfg in &config.models {

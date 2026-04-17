@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use flarion::config::{BackendType, FlarionConfig, ModelConfig};
+use flarion::config::{BackendType, FlarionConfig, ModelConfig, VramBudgetSetting};
 use flarion::engine::scheduling::ResidentSet;
 
 // Helper: build a sparse tempfile of `size_mb` MB.
@@ -46,12 +46,12 @@ fn lazy_models_not_loaded_at_startup_via_resident_set() {
 
     let mut cfg = FlarionConfig::default();
     cfg.server.host = "127.0.0.1".into();
-    cfg.server.vram_budget_mb = 1000;
+    cfg.server.vram_budget_mb = VramBudgetSetting::Fixed(1000);
     cfg.models = vec![local_model("m", path, true)];
     cfg.validate().expect("lazy model should validate");
 
     // Simulate startup: construct ResidentSet, iterate models, skip lazy.
-    let resident_set = ResidentSet::new(cfg.server.vram_budget_mb);
+    let resident_set = ResidentSet::new(1000);
     for m in &cfg.models {
         if m.backend == BackendType::Local && !m.lazy {
             let path = m.path.as_ref().unwrap();
@@ -70,11 +70,11 @@ fn eager_model_reserves_budget_at_startup_via_resident_set() {
 
     let mut cfg = FlarionConfig::default();
     cfg.server.host = "127.0.0.1".into();
-    cfg.server.vram_budget_mb = 1000;
+    cfg.server.vram_budget_mb = VramBudgetSetting::Fixed(1000);
     cfg.models = vec![local_model("m", path, false)];
     cfg.validate().expect("eager model should validate");
 
-    let resident_set = ResidentSet::new(cfg.server.vram_budget_mb);
+    let resident_set = ResidentSet::new(1000);
     for m in &cfg.models {
         if m.backend == BackendType::Local && !m.lazy {
             let path = m.path.as_ref().unwrap();
@@ -96,7 +96,7 @@ fn overbudget_eager_config_fails_validation() {
 
     let mut cfg = FlarionConfig::default();
     cfg.server.host = "127.0.0.1".into();
-    cfg.server.vram_budget_mb = 500;
+    cfg.server.vram_budget_mb = VramBudgetSetting::Fixed(500);
     cfg.models = vec![
         local_model("a", path_a, false),
         local_model("b", path_b, false),

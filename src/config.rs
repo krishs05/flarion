@@ -111,6 +111,44 @@ fn default_metrics_path() -> String {
     "/metrics".to_string()
 }
 
+/// How to derive the VRAM budget in MB.
+///
+/// `Fixed(n)` uses `n` verbatim (0 = scheduling disabled, matching 2F behavior).
+/// `Auto` queries NVML at startup and subtracts `vram_budget_headroom_mb`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VramBudgetSetting {
+    Auto,
+    Fixed(u64),
+}
+
+impl Default for VramBudgetSetting {
+    fn default() -> Self {
+        VramBudgetSetting::Fixed(0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for VramBudgetSetting {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Int(u64),
+            Str(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Int(n) => Ok(VramBudgetSetting::Fixed(n)),
+            Raw::Str(s) if s == "auto" => Ok(VramBudgetSetting::Auto),
+            Raw::Str(s) => Err(D::Error::custom(format!(
+                "vram_budget_mb: expected an integer or the string \"auto\", got {s:?}"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
     #[serde(default = "default_host")]
@@ -135,11 +173,15 @@ pub struct ServerConfig {
     /// Default false to block SSRF via mis-set env vars.
     #[serde(default)]
     pub allow_plaintext_upstream: bool,
-    /// VRAM budget in MB for local models. When estimated resident load
-    /// would exceed this, new loads return 503 `model_unavailable`. `0`
-    /// disables scheduling. Set near usable VRAM minus headroom.
+    /// VRAM budget for local models. `"auto"` queries NVML and subtracts
+    /// `vram_budget_headroom_mb`. An integer is used verbatim; `0` disables
+    /// scheduling.
     #[serde(default)]
-    pub vram_budget_mb: u64,
+    pub vram_budget_mb: VramBudgetSetting,
+
+    /// Only honored when `vram_budget_mb = "auto"`. Default 2048 MB.
+    #[serde(default = "default_vram_headroom_mb")]
+    pub vram_budget_headroom_mb: u64,
 }
 
 impl Default for ServerConfig {
@@ -152,7 +194,8 @@ impl Default for ServerConfig {
             allow_unauthenticated: false,
             cors_origins: Vec::new(),
             allow_plaintext_upstream: false,
-            vram_budget_mb: 0,
+            vram_budget_mb: VramBudgetSetting::Fixed(0),
+            vram_budget_headroom_mb: default_vram_headroom_mb(),
         }
     }
 }
@@ -265,6 +308,9 @@ fn default_log_level() -> String {
 }
 fn default_shutdown_grace_secs() -> u64 {
     30
+}
+fn default_vram_headroom_mb() -> u64 {
+    2048
 }
 
 /// Known provider-default base URLs. Used by SSRF validation when a cloud
@@ -533,56 +579,20 @@ impl FlarionConfig {
             }
         }
 
-        // Eager local models only — lazy models may not all be resident.
-        if self.server.vram_budget_mb > 0 {
+        let raw_budget_mb = match self.server.vram_budget_mb {
+            VramBudgetSetting::Fixed(n) => n,
+            VramBudgetSetting::Auto => 0, // Auto defers to runtime; skip static eager/pinned checks here.
+        };
+
+        if raw_budget_mb > 0 {
+            // Eager local models — lazy models may not all be resident.
             let mut total_mb: u64 = 0;
             let mut offenders: Vec<(String, u64)> = Vec::new();
             for m in &self.models {
                 if m.backend != BackendType::Local || m.lazy {
                     continue;
                 }
-                let path = m
-                    .path
-                    .as_ref()
-                    .expect("local backend path must be set — earlier validation ensures this");
-                let est =
-                    crate::engine::scheduling::estimate_vram_mb(path, m.vram_mb).map_err(|e| {
-                        match e {
-                            crate::engine::scheduling::EstimateError::StatFailed {
-                                path,
-                                source,
-                            } => ConfigError::VramEstimateFailed {
-                                id: m.id.clone(),
-                                path,
-                                source,
-                            },
-                        }
-                    })?;
-                total_mb = total_mb.saturating_add(est);
-                offenders.push((m.id.clone(), est));
-            }
-            if total_mb > self.server.vram_budget_mb {
-                return Err(ConfigError::EagerLoadsExceedBudget {
-                    total_mb,
-                    budget_mb: self.server.vram_budget_mb,
-                    offenders,
-                });
-            }
-        }
-
-        // Pinned local models — both eager and lazy — must all fit. Once
-        // loaded, pinned models can never be evicted.
-        if self.server.vram_budget_mb > 0 {
-            let mut total_mb: u64 = 0;
-            let mut offenders: Vec<(String, u64)> = Vec::new();
-            for m in &self.models {
-                if m.backend != BackendType::Local || !m.pin {
-                    continue;
-                }
-                let path = m
-                    .path
-                    .as_ref()
-                    .expect("local backend path must be set — earlier validation ensures this");
+                let path = m.path.as_ref().expect("local backend path must be set");
                 let est = crate::engine::scheduling::estimate_vram_mb(path, m.vram_mb)
                     .map_err(|e| match e {
                         crate::engine::scheduling::EstimateError::StatFailed { path, source } => {
@@ -592,10 +602,35 @@ impl FlarionConfig {
                 total_mb = total_mb.saturating_add(est);
                 offenders.push((m.id.clone(), est));
             }
-            if total_mb > self.server.vram_budget_mb {
+            if total_mb > raw_budget_mb {
+                return Err(ConfigError::EagerLoadsExceedBudget {
+                    total_mb,
+                    budget_mb: raw_budget_mb,
+                    offenders,
+                });
+            }
+
+            // Pinned local models — both eager and lazy — must all fit.
+            let mut total_mb: u64 = 0;
+            let mut offenders: Vec<(String, u64)> = Vec::new();
+            for m in &self.models {
+                if m.backend != BackendType::Local || !m.pin {
+                    continue;
+                }
+                let path = m.path.as_ref().expect("local backend path must be set");
+                let est = crate::engine::scheduling::estimate_vram_mb(path, m.vram_mb)
+                    .map_err(|e| match e {
+                        crate::engine::scheduling::EstimateError::StatFailed { path, source } => {
+                            ConfigError::VramEstimateFailed { id: m.id.clone(), path, source }
+                        }
+                    })?;
+                total_mb = total_mb.saturating_add(est);
+                offenders.push((m.id.clone(), est));
+            }
+            if total_mb > raw_budget_mb {
                 return Err(ConfigError::PinnedExceedsBudget {
                     total_mb,
-                    budget_mb: self.server.vram_budget_mb,
+                    budget_mb: raw_budget_mb,
                     offenders,
                 });
             }
@@ -2066,7 +2101,7 @@ gpu_layers = 99
     #[test]
     fn test_server_config_default_vram_budget_is_0() {
         let cfg = ServerConfig::default();
-        assert_eq!(cfg.vram_budget_mb, 0);
+        assert_eq!(cfg.vram_budget_mb, VramBudgetSetting::Fixed(0));
     }
 
     #[test]
@@ -2084,7 +2119,7 @@ context_size = 4096
 gpu_layers = 99
 "#;
         let cfg: FlarionConfig = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.server.vram_budget_mb, 0);
+        assert_eq!(cfg.server.vram_budget_mb, VramBudgetSetting::Fixed(0));
         assert!(!cfg.models[0].lazy);
         assert!(cfg.models[0].vram_mb.is_none());
     }
@@ -2107,7 +2142,7 @@ lazy = true
 vram_mb = 6000
 "#;
         let cfg: FlarionConfig = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.server.vram_budget_mb, 22000);
+        assert_eq!(cfg.server.vram_budget_mb, VramBudgetSetting::Fixed(22000));
         assert!(cfg.models[0].lazy);
         assert_eq!(cfg.models[0].vram_mb, Some(6000));
     }
@@ -2180,7 +2215,7 @@ vram_mb = 6000
         let (_b_dir, b_path) = make_fake_gguf(100);
         let mut cfg = FlarionConfig::default();
         cfg.server.host = "127.0.0.1".into();
-        cfg.server.vram_budget_mb = 500;
+        cfg.server.vram_budget_mb = VramBudgetSetting::Fixed(500);
         cfg.models = vec![local_cfg("a", a_path), local_cfg("b", b_path)];
         // 100MB * 1.2 = 120MB each → 240MB total < 500MB budget.
         cfg.validate().unwrap();
@@ -2193,7 +2228,7 @@ vram_mb = 6000
         let (_c_dir, c_path) = make_fake_gguf(200);
         let mut cfg = FlarionConfig::default();
         cfg.server.host = "127.0.0.1".into();
-        cfg.server.vram_budget_mb = 500;
+        cfg.server.vram_budget_mb = VramBudgetSetting::Fixed(500);
         cfg.models = vec![
             local_cfg("a", a_path),
             local_cfg("b", b_path),
@@ -2226,7 +2261,7 @@ vram_mb = 6000
         let (_b_dir, b_path) = make_fake_gguf(200);
         let mut cfg = FlarionConfig::default();
         cfg.server.host = "127.0.0.1".into();
-        cfg.server.vram_budget_mb = 300;
+        cfg.server.vram_budget_mb = VramBudgetSetting::Fixed(300);
         let mut lazy_model = local_cfg("lazy", b_path);
         lazy_model.lazy = true;
         cfg.models = vec![local_cfg("eager", a_path), lazy_model];
@@ -2301,7 +2336,7 @@ vram_mb = 6000
 
         let mut cfg = FlarionConfig::default();
         cfg.server.host = "127.0.0.1".into();
-        cfg.server.vram_budget_mb = 500;
+        cfg.server.vram_budget_mb = VramBudgetSetting::Fixed(500);
         cfg.models = vec![
             ModelConfig {
                 id: "a".into(),
@@ -2372,5 +2407,64 @@ vram_mb = 6000
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_vram_budget_setting_deserializes_fixed_integer() {
+        let toml = r#"
+        [server]
+        host = "127.0.0.1"
+        vram_budget_mb = 22000
+        [[models]]
+        id = "m"
+        backend = "local"
+        path = "/tmp/m.gguf"
+    "#;
+        let cfg: FlarionConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.server.vram_budget_mb, VramBudgetSetting::Fixed(22000));
+    }
+
+    #[test]
+    fn test_vram_budget_setting_deserializes_auto_string() {
+        let toml = r#"
+        [server]
+        host = "127.0.0.1"
+        vram_budget_mb = "auto"
+        [[models]]
+        id = "m"
+        backend = "local"
+        path = "/tmp/m.gguf"
+    "#;
+        let cfg: FlarionConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.server.vram_budget_mb, VramBudgetSetting::Auto);
+    }
+
+    #[test]
+    fn test_vram_budget_setting_rejects_other_strings() {
+        let toml = r#"
+        [server]
+        host = "127.0.0.1"
+        vram_budget_mb = "not-auto"
+        [[models]]
+        id = "m"
+        backend = "local"
+        path = "/tmp/m.gguf"
+    "#;
+        let err = toml::from_str::<FlarionConfig>(toml).unwrap_err();
+        assert!(format!("{err}").contains("auto"), "got {err}");
+    }
+
+    #[test]
+    fn test_vram_budget_setting_defaults_to_fixed_zero() {
+        let toml = r#"
+        [server]
+        host = "127.0.0.1"
+        [[models]]
+        id = "m"
+        backend = "local"
+        path = "/tmp/m.gguf"
+    "#;
+        let cfg: FlarionConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.server.vram_budget_mb, VramBudgetSetting::Fixed(0));
     }
 }
