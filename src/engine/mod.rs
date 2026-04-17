@@ -6,3 +6,4 @@ pub mod registry;
 pub mod scheduling;
 
 pub mod testing;
+pub mod vram_detect;

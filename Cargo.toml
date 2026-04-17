@@ -1,6 +1,6 @@
 [package]
 name = "flarion"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 license = "MIT"
 description = "A Rust-native LLM inference gateway"
@@ -32,6 +32,7 @@ regex = "1"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
 url = "2"
+nvml-wrapper = "0.10"
 
 [dev-dependencies]
 http-body-util = "0.1"
