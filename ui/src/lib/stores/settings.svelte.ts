@@ -12,7 +12,7 @@ export interface Settings {
 }
 
 const DEFAULT: Settings = {
-  baseUrl: 'http://localhost:8080',
+  baseUrl: 'http://127.0.0.1:8080',
   defaultParams: {
     temperature: 0.7,
     topP: 0.9,
@@ -26,8 +26,24 @@ function load(): Settings {
   if (!raw) return DEFAULT;
   try {
     const parsed = JSON.parse(raw);
+    let baseUrl = parsed.baseUrl ?? DEFAULT.baseUrl;
+    if (baseUrl === 'http://localhost:8080') {
+      baseUrl = 'http://127.0.0.1:8080';
+      localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({
+          ...parsed,
+          baseUrl,
+          defaultParams: {
+            temperature: parsed.defaultParams?.temperature ?? DEFAULT.defaultParams.temperature,
+            topP: parsed.defaultParams?.topP ?? DEFAULT.defaultParams.topP,
+            maxTokens: parsed.defaultParams?.maxTokens ?? DEFAULT.defaultParams.maxTokens
+          }
+        })
+      );
+    }
     return {
-      baseUrl: parsed.baseUrl ?? DEFAULT.baseUrl,
+      baseUrl,
       defaultParams: {
         temperature: parsed.defaultParams?.temperature ?? DEFAULT.defaultParams.temperature,
         topP: parsed.defaultParams?.topP ?? DEFAULT.defaultParams.topP,

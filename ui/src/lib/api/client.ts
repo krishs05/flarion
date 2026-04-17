@@ -43,3 +43,20 @@ export async function chatCompletion(
   if (!res.ok) throw await parseError(res);
   return res.json();
 }
+
+/**
+ * Fetch raw Prometheus metrics text. Many servers dedicate this to a
+ * trusted listener (Phase 2d); if unreachable we just return null.
+ */
+export async function getMetrics(
+  baseUrl: string,
+  signal?: AbortSignal
+): Promise<string | null> {
+  try {
+    const res = await fetch(`${baseUrl}/metrics`, { signal });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null;
+  }
+}

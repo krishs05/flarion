@@ -3,6 +3,9 @@
   import { settings } from '$lib/stores/settings.svelte';
   import { FlarionApiError } from '$lib/api/types';
   import ResponseViewer from './ResponseViewer.svelte';
+  import Button from '$lib/components/ui/Button.svelte';
+  import Badge from '$lib/components/ui/Badge.svelte';
+  import Play from '@lucide/svelte/icons/play';
 
   let loading = $state(false);
   let data = $state<unknown>(null);
@@ -31,21 +34,16 @@
   }
 </script>
 
-<div class="space-y-4">
-  <div class="flex items-center gap-3">
-    <code class="font-mono text-sm text-cyan-flare">GET</code>
-    <code class="font-mono text-sm text-frost">{settings.baseUrl}/health</code>
+<div class="space-y-5">
+  <div class="flex items-center gap-3 flex-wrap">
+    <Badge tone="cyan">GET</Badge>
+    <code class="font-mono text-sm text-frost-hi">{settings.baseUrl}/health</code>
   </div>
 
-  <button
-    onclick={run}
-    disabled={loading}
-    class="px-4 py-2 bg-ember text-midnight font-mono text-sm rounded-md
-      hover:shadow-[0_0_12px_rgba(255,107,43,0.3)] transition-shadow
-      disabled:opacity-40 disabled:cursor-not-allowed"
-  >
-    {loading ? 'testing...' : 'test'}
-  </button>
+  <Button variant="primary" onclick={run} {loading}>
+    {#snippet icon()}<Play class="w-3.5 h-3.5" />{/snippet}
+    {loading ? 'testing…' : 'send request'}
+  </Button>
 
   <ResponseViewer {data} {status} {error} />
 </div>

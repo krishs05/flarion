@@ -4,6 +4,10 @@
   import { connection } from '$lib/stores/connection.svelte';
   import { FlarionApiError } from '$lib/api/types';
   import ResponseViewer from './ResponseViewer.svelte';
+  import Button from '$lib/components/ui/Button.svelte';
+  import Badge from '$lib/components/ui/Badge.svelte';
+  import Play from '@lucide/svelte/icons/play';
+  import RotateCcw from '@lucide/svelte/icons/rotate-ccw';
 
   function defaultBody() {
     return JSON.stringify(
@@ -44,7 +48,10 @@
     }
 
     try {
-      data = await chatCompletion(settings.baseUrl, { ...parsed, stream: false } as Parameters<typeof chatCompletion>[1]);
+      data = await chatCompletion(
+        settings.baseUrl,
+        { ...parsed, stream: false } as Parameters<typeof chatCompletion>[1]
+      );
       status = 200;
     } catch (e) {
       if (e instanceof FlarionApiError) {
@@ -60,42 +67,40 @@
   }
 </script>
 
-<div class="space-y-4">
-  <div class="flex items-center gap-3">
-    <code class="font-mono text-sm text-cyan-flare">POST</code>
-    <code class="font-mono text-sm text-frost">{settings.baseUrl}/v1/chat/completions</code>
+<div class="space-y-5">
+  <div class="flex items-center gap-3 flex-wrap">
+    <Badge tone="ember">POST</Badge>
+    <code class="font-mono text-sm text-frost-hi">{settings.baseUrl}/v1/chat/completions</code>
   </div>
 
   <div>
     <div class="flex items-center justify-between mb-2">
-      <label for="chat-body" class="font-mono text-xs text-graphite uppercase tracking-wider">
-        request body (json)
+      <label for="chat-body" class="font-mono text-[10px] uppercase tracking-wider text-graphite">
+        request body · json
       </label>
       <button
         onclick={resetBody}
-        class="font-mono text-xs text-graphite hover:text-ember transition-colors"
+        class="font-mono text-[10px] uppercase tracking-wider text-graphite hover:text-ember
+          transition-colors inline-flex items-center gap-1"
       >
+        <RotateCcw class="w-3 h-3" />
         reset
       </button>
     </div>
     <textarea
       id="chat-body"
       bind:value={body}
-      rows="12"
-      class="w-full bg-carbon border border-wire rounded-md p-3 font-mono text-sm text-frost
-        focus:border-ember outline-none resize-y"
+      rows="14"
+      class="w-full bg-midnight/60 border border-wire rounded-lg p-3 font-mono text-xs text-frost
+        focus:border-ember focus:bg-midnight outline-none resize-y leading-relaxed
+        transition-colors"
     ></textarea>
   </div>
 
-  <button
-    onclick={run}
-    disabled={loading}
-    class="px-4 py-2 bg-ember text-midnight font-mono text-sm rounded-md
-      hover:shadow-[0_0_12px_rgba(255,107,43,0.3)] transition-shadow
-      disabled:opacity-40 disabled:cursor-not-allowed"
-  >
-    {loading ? 'sending...' : 'send'}
-  </button>
+  <Button variant="primary" onclick={run} {loading}>
+    {#snippet icon()}<Play class="w-3.5 h-3.5" />{/snippet}
+    {loading ? 'sending…' : 'send request'}
+  </Button>
 
   <ResponseViewer {data} {status} {error} />
 </div>

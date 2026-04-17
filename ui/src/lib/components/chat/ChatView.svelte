@@ -1,5 +1,13 @@
 <script lang="ts">
-  import { getActive, appendMessage, appendToLastMessage, finalizeLastMessage, newChat, persistChats } from '$lib/stores/chats.svelte';
+  import AlertTriangle from '@lucide/svelte/icons/alert-triangle';
+  import {
+    getActive,
+    appendMessage,
+    appendToLastMessage,
+    finalizeLastMessage,
+    newChat,
+    persistChats
+  } from '$lib/stores/chats.svelte';
   import { settings } from '$lib/stores/settings.svelte';
   import { connection } from '$lib/stores/connection.svelte';
   import { streamChatCompletion } from '$lib/api/streaming';
@@ -7,41 +15,61 @@
   import ModelParams from './ModelParams.svelte';
   import MessageList from './MessageList.svelte';
   import ChatInput from './ChatInput.svelte';
+  import ChatHistoryPanel from './ChatHistoryPanel.svelte';
 
   let active = $derived(getActive());
   let streaming = $state(false);
   let error = $state<string | null>(null);
   let streamingIndex = $state<number | null>(null);
 
+  let model = $state(connection.modelId ?? '');
   let temperature = $state(settings.defaultParams.temperature);
   let topP = $state(settings.defaultParams.topP);
   let maxTokens = $state(settings.defaultParams.maxTokens);
 
-  function handleParamsChange(p: { temperature: number; topP: number; maxTokens: number }) {
+  $effect(() => {
+    if (!model && connection.modelId) {
+      model = connection.modelId;
+    }
+  });
+
+  function handleParamsChange(p: {
+    model: string;
+    temperature: number;
+    topP: number;
+    maxTokens: number;
+  }) {
+    model = p.model;
     temperature = p.temperature;
     topP = p.topP;
     maxTokens = p.maxTokens;
+  }
+
+  let abortController: AbortController | null = null;
+
+  function handleStop() {
+    abortController?.abort();
   }
 
   async function handleSend(text: string) {
     error = null;
     let chat = active;
     if (!chat) {
-      const model = connection.modelId ?? 'unknown';
-      chat = newChat(model);
+      chat = newChat(model || connection.modelId || 'unknown');
     }
 
     const chatId = chat.id;
+    const effectiveModel = model || chat.model;
+    chat.model = effectiveModel;
+
     appendMessage(chatId, { role: 'user', content: text });
     appendMessage(chatId, { role: 'assistant', content: '' });
     streamingIndex = chat.messages.length - 1;
     streaming = true;
 
     const request: ChatCompletionRequest = {
-      model: chat.model,
-      messages: chat.messages
-        .slice(0, -1)
-        .map(({ role, content }) => ({ role, content })),
+      model: effectiveModel,
+      messages: chat.messages.slice(0, -1).map(({ role, content }) => ({ role, content })),
       temperature,
       top_p: topP,
       max_tokens: maxTokens,
@@ -52,8 +80,10 @@
     let firstTokenAt: number | null = null;
     let tokenCount = 0;
 
+    abortController = new AbortController();
+
     try {
-      for await (const chunk of streamChatCompletion(settings.baseUrl, request)) {
+      for await (const chunk of streamChatCompletion(settings.baseUrl, request, abortController.signal)) {
         const delta = chunk.choices[0]?.delta?.content;
         if (delta) {
           if (firstTokenAt === null) firstTokenAt = performance.now();
@@ -74,38 +104,56 @@
         durationMs: Math.round(durationMs)
       });
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      if (!(e instanceof DOMException && e.name === 'AbortError')) {
+        error = e instanceof Error ? e.message : String(e);
+      }
       persistChats();
     } finally {
       streaming = false;
       streamingIndex = null;
+      abortController = null;
     }
   }
 
   let inputDisabled = $derived(streaming || !connection.connected);
 </script>
 
-<div class="h-full flex flex-col">
-  <ModelParams
-    {temperature}
-    {topP}
-    {maxTokens}
-    onChange={handleParamsChange}
-  />
+<div class="h-full flex min-w-0">
+  <ChatHistoryPanel />
 
-  {#if error}
-    <div class="px-4 py-2 bg-signal/20 border-b border-signal text-signal font-mono text-xs">
-      error: {error}
-    </div>
-  {/if}
+  <div class="flex-1 flex flex-col min-w-0">
+    <ModelParams
+      {model}
+      {temperature}
+      {topP}
+      {maxTokens}
+      onChange={handleParamsChange}
+    />
 
-  {#if active}
-    <MessageList messages={active.messages} {streamingIndex} />
-  {:else}
-    <div class="flex-1 flex items-center justify-center text-graphite font-mono text-sm uppercase tracking-wider">
-      {connection.connected ? 'click "+ new chat" or send a message to begin' : 'connect to flarion to start chatting'}
-    </div>
-  {/if}
+    {#if error}
+      <div class="px-5 py-2.5 bg-signal/10 border-b border-signal/30 flex items-center gap-2">
+        <AlertTriangle class="w-4 h-4 text-signal shrink-0" />
+        <span class="font-mono text-xs text-signal">error: {error}</span>
+      </div>
+    {/if}
 
-  <ChatInput disabled={inputDisabled} onSend={handleSend} />
+    {#if active}
+      <MessageList messages={active.messages} {streamingIndex} />
+    {:else}
+      <div class="flex-1 flex items-center justify-center">
+        <div class="text-center">
+          <div class="font-mono text-[11px] uppercase tracking-[0.16em] text-graphite">
+            {connection.connected ? 'no chat selected' : 'flarion offline'}
+          </div>
+          <div class="mt-2 text-sm text-graphite-hi">
+            {connection.connected
+              ? 'create a new chat or send a message below'
+              : 'check the endpoint in settings'}
+          </div>
+        </div>
+      </div>
+    {/if}
+
+    <ChatInput disabled={inputDisabled} streaming={streaming} onSend={handleSend} onStop={handleStop} />
+  </div>
 </div>

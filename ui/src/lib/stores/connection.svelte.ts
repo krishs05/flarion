@@ -1,26 +1,36 @@
-import { getHealth } from '$lib/api/client';
+import { getHealth, getMetrics } from '$lib/api/client';
+import { parseMetrics, summarize, type MetricsSummary } from '$lib/api/metrics';
+import type { ModelStatus } from '$lib/api/types';
 import { settings } from './settings.svelte';
 
-export interface ConnectionStatus {
+export interface ConnectionState {
   connected: boolean;
   version: string | null;
+  models: ModelStatus[];
   modelId: string | null;
   modelLoaded: boolean;
   allHealthy: boolean;
   modelCount: number;
+  loadedCount: number;
   error: string | null;
   lastCheck: number;
+  metrics: MetricsSummary | null;
+  metricsAvailable: boolean;
 }
 
-export const connection = $state<ConnectionStatus>({
+export const connection = $state<ConnectionState>({
   connected: false,
   version: null,
+  models: [],
   modelId: null,
   modelLoaded: false,
   allHealthy: false,
   modelCount: 0,
+  loadedCount: 0,
   error: null,
-  lastCheck: 0
+  lastCheck: 0,
+  metrics: null,
+  metricsAvailable: false
 });
 
 let pollInterval: ReturnType<typeof setInterval> | null = null;
@@ -36,7 +46,9 @@ async function checkOnce() {
     connection.connected = true;
     connection.version = res.version;
     connection.allHealthy = res.all_healthy;
+    connection.models = res.models;
     connection.modelCount = res.models.length;
+    connection.loadedCount = res.models.filter((m) => m.loaded).length;
     const first = res.models[0];
     connection.modelId = first?.id ?? null;
     connection.modelLoaded = first?.loaded ?? false;
@@ -44,14 +56,37 @@ async function checkOnce() {
   } catch (err) {
     connection.connected = false;
     connection.version = null;
+    connection.models = [];
     connection.modelId = null;
     connection.modelLoaded = false;
     connection.allHealthy = false;
     connection.modelCount = 0;
+    connection.loadedCount = 0;
     connection.error = err instanceof Error ? err.message : String(err);
   } finally {
     clearTimeout(timeout);
     connection.lastCheck = Date.now();
+  }
+
+  if (connection.connected) {
+    const metricsController = new AbortController();
+    const metricsTimeout = setTimeout(() => metricsController.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const text = await getMetrics(settings.baseUrl, metricsController.signal);
+      if (text) {
+        connection.metrics = summarize(parseMetrics(text));
+        connection.metricsAvailable = true;
+      } else {
+        connection.metricsAvailable = false;
+      }
+    } catch {
+      connection.metricsAvailable = false;
+    } finally {
+      clearTimeout(metricsTimeout);
+    }
+  } else {
+    connection.metrics = null;
+    connection.metricsAvailable = false;
   }
 }
 
