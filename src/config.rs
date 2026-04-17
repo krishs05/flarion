@@ -216,6 +216,46 @@ impl ServerConfig {
         }
         false
     }
+
+    /// Resolve the configured `vram_budget_mb` to a concrete u64 for
+    /// `ResidentSet::new`. `Fixed(n)` → n. `Auto` → NVML device 0 total MB
+    /// minus `vram_budget_headroom_mb`.
+    pub fn resolve_vram_budget_mb(&self) -> Result<u64, ConfigError> {
+        match self.vram_budget_mb {
+            VramBudgetSetting::Fixed(n) => Ok(n),
+            VramBudgetSetting::Auto => {
+                let info = crate::engine::vram_detect::detect_device_zero()
+                    .map_err(|source| ConfigError::VramAutoDetectFailed { source })?;
+                let resolved = Self::resolve_vram_budget_mb_from_info(
+                    &info,
+                    self.vram_budget_headroom_mb,
+                )?;
+                tracing::info!(
+                    budget_mb = resolved,
+                    source = "auto",
+                    device = info.device_index,
+                    total_mb = info.total_mb,
+                    headroom_mb = self.vram_budget_headroom_mb,
+                    "vram budget resolved"
+                );
+                Ok(resolved)
+            }
+        }
+    }
+
+    /// Pure-arithmetic helper split out for testing (no NVML call).
+    pub fn resolve_vram_budget_mb_from_info(
+        info: &crate::engine::vram_detect::VramInfo,
+        headroom_mb: u64,
+    ) -> Result<u64, ConfigError> {
+        if info.total_mb <= headroom_mb {
+            return Err(ConfigError::VramAutoDetectInsufficient {
+                total_mb: info.total_mb,
+                headroom_mb,
+            });
+        }
+        Ok(info.total_mb - headroom_mb)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -839,6 +879,15 @@ pub enum ConfigError {
         budget_mb: u64,
         offenders: Vec<(String, u64)>,
     },
+
+    #[error("auto VRAM detection failed: {source}; set vram_budget_mb to an explicit integer MB or 0 to disable")]
+    VramAutoDetectFailed {
+        #[source]
+        source: crate::engine::vram_detect::VramDetectError,
+    },
+
+    #[error("detected VRAM ({total_mb}MB) is <= headroom ({headroom_mb}MB); reduce vram_budget_headroom_mb")]
+    VramAutoDetectInsufficient { total_mb: u64, headroom_mb: u64 },
 }
 
 #[cfg(test)]
@@ -2466,5 +2515,36 @@ vram_mb = 6000
     "#;
         let cfg: FlarionConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.server.vram_budget_mb, VramBudgetSetting::Fixed(0));
+    }
+
+    #[test]
+    fn test_resolve_fixed_passes_through() {
+        let server = ServerConfig { vram_budget_mb: VramBudgetSetting::Fixed(22000), ..ServerConfig::default() };
+        assert_eq!(server.resolve_vram_budget_mb().unwrap(), 22000);
+    }
+
+    #[test]
+    fn test_resolve_fixed_zero_is_disabled() {
+        let server = ServerConfig::default();
+        assert_eq!(server.resolve_vram_budget_mb().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_resolve_headroom_exceeds_total_returns_insufficient() {
+        use crate::engine::vram_detect::VramInfo;
+        let info = VramInfo { device_index: 0, total_mb: 1000, free_mb: 500 };
+        let err = ServerConfig::resolve_vram_budget_mb_from_info(&info, 2000).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::VramAutoDetectInsufficient { total_mb: 1000, headroom_mb: 2000 }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_subtracts_headroom_from_total() {
+        use crate::engine::vram_detect::VramInfo;
+        let info = VramInfo { device_index: 0, total_mb: 24000, free_mb: 20000 };
+        let got = ServerConfig::resolve_vram_budget_mb_from_info(&info, 2000).unwrap();
+        assert_eq!(got, 22000);
     }
 }

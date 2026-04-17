@@ -70,10 +70,10 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let budget_mb = match config.server.vram_budget_mb {
-        flarion::config::VramBudgetSetting::Fixed(n) => n,
-        flarion::config::VramBudgetSetting::Auto => {
-            tracing::error!("vram_budget_mb = \"auto\" requires Phase 2G NVML resolution (not yet wired)");
+    let budget_mb = match config.server.resolve_vram_budget_mb() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!("failed to resolve VRAM budget: {e}");
             std::process::exit(1);
         }
     };
