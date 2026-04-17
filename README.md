@@ -298,6 +298,26 @@ lazy = true              # loaded on first request
   and the estimated footprint (`file size * 1.2`, or `vram_mb` override).
   Actual CUDA allocations might differ; set conservatively.
 
+## Migrating from 0.7.x
+
+v0.8.0 adds LRU hot-swap, model pinning, and NVML-based auto VRAM detection.
+All changes are opt-in; default behavior is identical to 0.7.x.
+
+- Set `vram_budget_mb = "auto"` (+ `vram_budget_headroom_mb = 2048`) to let
+  Flarion pick the budget from NVML at startup.
+- Mark always-on models with `pin = true`. Flarion refuses to start if pinned
+  local models total more than the budget.
+- When a lazy model's load would exceed the budget, Flarion now evicts the
+  least-recently-used unpinned non-busy model instead of returning 503. If
+  no eviction candidate is available (all pinned or all busy), the request
+  returns 503 with `Retry-After: 5`.
+- 503 `model_unavailable` responses now carry `Retry-After: 5`;
+  OpenAI-compatible clients that honor the header retry automatically.
+
+New metrics:
+- `flarion_model_evictions_total{model, reason}`
+- `flarion_model_unloads_total{model, result}`
+
 ## Migrating from 0.6.x
 
 v0.7.0 adds lazy loading and VRAM budget scheduling. All changes are

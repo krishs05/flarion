@@ -57,6 +57,16 @@ impl Default for BackendRegistry {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::engine::backend::Evictor for BackendRegistry {
+    async fn unload(&self, model_id: &str) -> Result<(), crate::error::EngineError> {
+        let backend = self.get(model_id).ok_or_else(|| {
+            crate::error::EngineError::ModelNotFound(model_id.to_string())
+        })?;
+        backend.unload().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +116,23 @@ mod tests {
         let registry = BackendRegistry::new();
         assert!(registry.is_empty());
         assert_eq!(registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_evictor_unload_known_model_returns_ok() {
+        use crate::engine::backend::Evictor;
+        let mut reg = BackendRegistry::new();
+        reg.insert("m".into(), mock("m"));
+        let reg = Arc::new(reg);
+        // Default no-op unload returns Ok.
+        reg.unload("m").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_evictor_unload_unknown_model_returns_not_found() {
+        use crate::engine::backend::Evictor;
+        let reg = Arc::new(BackendRegistry::new());
+        let err = reg.unload("nope").await.unwrap_err();
+        assert!(matches!(err, crate::error::EngineError::ModelNotFound(_)));
     }
 }

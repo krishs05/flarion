@@ -70,12 +70,22 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let resident_set = flarion::engine::scheduling::ResidentSet::new(config.server.vram_budget_mb);
-    flarion::metrics::set_vram_budget(config.server.vram_budget_mb);
+    let budget_mb = match config.server.resolve_vram_budget_mb() {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!("failed to resolve VRAM budget: {e}");
+            std::process::exit(1);
+        }
+    };
+    let resident_set = flarion::engine::scheduling::ResidentSet::new(budget_mb);
+    flarion::metrics::set_vram_budget(budget_mb);
+
+    let load_coordinator: Arc<tokio::sync::Mutex<()>> =
+        Arc::new(tokio::sync::Mutex::new(()));
 
     let mut registry = BackendRegistry::new();
     for model_cfg in &config.models {
-        match load_backend(model_cfg, resident_set.clone()).await {
+        match load_backend(model_cfg, resident_set.clone(), load_coordinator.clone()).await {
             Ok(backend) => {
                 tracing::info!(model_id = %model_cfg.id, "model loaded successfully");
                 registry.insert(model_cfg.id.clone(), backend);
@@ -114,6 +124,15 @@ async fn main() -> anyhow::Result<()> {
 
     let registry = Arc::new(registry);
     tracing::info!(loaded = registry.len(), "all models and routes loaded");
+
+    // Bind the evictor onto every backend. Cloud backends treat this as a
+    // no-op (their default trait impl). Local backends install a Weak so
+    // the Registry→backend Arc cycle doesn't leak on shutdown.
+    let evictor: Arc<dyn flarion::engine::backend::Evictor> = registry.clone();
+    let evictor_weak = Arc::downgrade(&evictor);
+    for backend in registry.backends() {
+        backend.bind_evictor(evictor_weak.clone()).await;
+    }
 
     let app = server::create_router(
         registry.clone(),
@@ -202,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
 async fn load_backend(
     cfg: &ModelConfig,
     resident_set: std::sync::Arc<flarion::engine::scheduling::ResidentSet>,
+    load_coordinator: std::sync::Arc<tokio::sync::Mutex<()>>,
 ) -> anyhow::Result<Arc<dyn InferenceBackend>> {
     match cfg.backend {
         BackendType::Local => {
@@ -211,7 +231,7 @@ async fn load_backend(
                 .expect("local backend path must be set — earlier validation ensures this");
             let estimated_mb = flarion::engine::scheduling::estimate_vram_mb(path, cfg.vram_mb)
                 .map_err(|e| anyhow::anyhow!("VRAM estimation failed for '{}': {e}", cfg.id))?;
-            let backend = LlamaBackend::new(cfg, resident_set, estimated_mb)?;
+            let backend = LlamaBackend::new(cfg, resident_set, estimated_mb, load_coordinator)?;
             if !cfg.lazy {
                 backend.load().await?;
             } else {
@@ -290,6 +310,7 @@ mod tests {
                 max_tokens_cap: None,
                 lazy: false,
                 vram_mb: None,
+                pin: false,
             }],
             ..FlarionConfig::default()
         }
