@@ -933,4 +933,66 @@ mod tests {
         assert_eq!(calls.lock().unwrap().as_slice(), &["old".to_string()]);
         assert_eq!(resident_set.total_reserved_mb(), 600);
     }
+
+    #[tokio::test]
+    async fn two_parallel_lazy_loads_serialize_via_coordinator() {
+        // This test validates only the coordinator mutex — not the worker
+        // spawn, which requires a real GGUF. We drive try_reserve_with_eviction
+        // on two backends sharing the same resident_set + load_coordinator and
+        // assert that the total reserved never exceeds budget.
+        use crate::engine::backend::Evictor;
+
+        // Stub evictor that always refuses (no-op unload returns BackendBusy) —
+        // tests that the FIRST reserver wins without interference.
+        struct RefusingEvictor;
+        #[async_trait]
+        impl Evictor for RefusingEvictor {
+            async fn unload(&self, _id: &str) -> Result<(), EngineError> {
+                Err(EngineError::BackendBusy)
+            }
+        }
+
+        let resident_set = crate::engine::scheduling::ResidentSet::new(1000);
+        let coord: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+        let stub: Arc<dyn Evictor> = Arc::new(RefusingEvictor);
+        let weak = Arc::downgrade(&stub);
+
+        let mut cfg_a = test_config();
+        cfg_a.id = "a".into();
+        cfg_a.lazy = true;
+        let a = Arc::new(LlamaBackend::new(&cfg_a, resident_set.clone(), 600, coord.clone()).unwrap());
+        a.bind_evictor(weak.clone()).await;
+
+        let mut cfg_b = test_config();
+        cfg_b.id = "b".into();
+        cfg_b.lazy = true;
+        let b = Arc::new(LlamaBackend::new(&cfg_b, resident_set.clone(), 600, coord.clone()).unwrap());
+        b.bind_evictor(weak.clone()).await;
+
+        // Drive both reservations concurrently with the SAME load_coordinator
+        // held manually around each call so serialization is observable in
+        // this test (production serializes via load_as_leader, not directly).
+        let a2 = a.clone();
+        let b2 = b.clone();
+        let coord_a = coord.clone();
+        let coord_b = coord.clone();
+        let fa = tokio::spawn(async move {
+            let _g = coord_a.lock().await;
+            a2.try_reserve_with_eviction().await
+        });
+        let fb = tokio::spawn(async move {
+            let _g = coord_b.lock().await;
+            b2.try_reserve_with_eviction().await
+        });
+
+        let (ra, rb) = tokio::join!(fa, fb);
+        let ra = ra.unwrap();
+        let rb = rb.unwrap();
+
+        // Exactly one succeeded (the first to grab coord); the other failed
+        // because budget was full and RefusingEvictor refuses every unload.
+        let succ = ra.is_ok() as u32 + rb.is_ok() as u32;
+        assert_eq!(succ, 1, "expected exactly one success, got {ra:?} / {rb:?}");
+        assert_eq!(resident_set.total_reserved_mb(), 600);
+    }
 }
