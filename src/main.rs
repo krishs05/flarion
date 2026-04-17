@@ -70,22 +70,35 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let budget_mb = match config.server.resolve_vram_budget_mb() {
-        Ok(n) => n,
+    // Phase 2H: compute declared device count from [[models]].gpus.
+    let declared_device_count = config
+        .models
+        .iter()
+        .flat_map(|m| m.gpus.iter().copied())
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(1);
+
+    // Resolve per-device budgets (Auto mode ignores declared_device_count).
+    let budgets = match config.server.resolve_vram_budgets(declared_device_count) {
+        Ok(b) => b,
         Err(e) => {
-            tracing::error!("failed to resolve VRAM budget: {e}");
+            tracing::error!("failed to resolve VRAM budgets: {e}");
             std::process::exit(1);
         }
     };
-    let resident_set = flarion::engine::scheduling::ResidentSet::new(budget_mb);
-    flarion::metrics::set_vram_budget(budget_mb);
+
+    let scheduler = flarion::engine::scheduling::Scheduler::new(budgets.clone());
+    for (gpu_id, &budget_mb) in budgets.iter().enumerate() {
+        flarion::metrics::set_vram_budget_on_gpu(gpu_id as u32, budget_mb);
+    }
 
     let load_coordinator: Arc<tokio::sync::Mutex<()>> =
         Arc::new(tokio::sync::Mutex::new(()));
 
     let mut registry = BackendRegistry::new();
     for model_cfg in &config.models {
-        match load_backend(model_cfg, resident_set.clone(), load_coordinator.clone()).await {
+        match load_backend(model_cfg, scheduler.clone(), load_coordinator.clone()).await {
             Ok(backend) => {
                 tracing::info!(model_id = %model_cfg.id, "model loaded successfully");
                 registry.insert(model_cfg.id.clone(), backend);
@@ -220,7 +233,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn load_backend(
     cfg: &ModelConfig,
-    resident_set: std::sync::Arc<flarion::engine::scheduling::ResidentSet>,
+    scheduler: std::sync::Arc<flarion::engine::scheduling::Scheduler>,
     load_coordinator: std::sync::Arc<tokio::sync::Mutex<()>>,
 ) -> anyhow::Result<Arc<dyn InferenceBackend>> {
     match cfg.backend {
@@ -231,7 +244,7 @@ async fn load_backend(
                 .expect("local backend path must be set — earlier validation ensures this");
             let estimated_mb = flarion::engine::scheduling::estimate_vram_mb(path, cfg.vram_mb)
                 .map_err(|e| anyhow::anyhow!("VRAM estimation failed for '{}': {e}", cfg.id))?;
-            let backend = LlamaBackend::new(cfg, resident_set, estimated_mb, load_coordinator)?;
+            let backend = LlamaBackend::new(cfg, scheduler, estimated_mb, load_coordinator)?;
             if !cfg.lazy {
                 backend.load().await?;
             } else {
@@ -311,6 +324,7 @@ mod tests {
                 lazy: false,
                 vram_mb: None,
                 pin: false,
+                gpus: vec![],
             }],
             ..FlarionConfig::default()
         }

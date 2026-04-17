@@ -15,7 +15,6 @@ pub const REQUEST_DURATION_SECONDS: &str = "flarion_request_duration_seconds";
 pub const PROMPT_TOKENS: &str = "flarion_prompt_tokens";
 pub const COMPLETION_TOKENS: &str = "flarion_completion_tokens";
 
-#[allow(dead_code)]
 pub const BUILD_INFO: &str = "flarion_build_info";
 
 const SECONDS_BUCKETS: &[f64] = &[0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0];
@@ -51,11 +50,11 @@ pub fn install() -> Result<Arc<PrometheusHandle>, String> {
     );
     metrics::describe_gauge!(
         "flarion_vram_budget_mb",
-        "Configured VRAM budget for local model scheduling, in MB"
+        "Configured VRAM budget per GPU, in MB (labeled by gpu)"
     );
     metrics::describe_gauge!(
         "flarion_vram_reserved_mb",
-        "Current reserved VRAM for a specific model, in MB"
+        "Reserved VRAM for a specific model on a specific GPU, in MB (labeled by model, gpu)"
     );
     metrics::describe_counter!(
         "flarion_model_loads_total",
@@ -81,14 +80,23 @@ pub fn set_backend_poisoned(model_id: &str, poisoned: bool) {
     metrics::gauge!("flarion_backend_poisoned", "model" => model_id.to_string()).set(value);
 }
 
-/// Set the `flarion_vram_budget_mb` gauge. Call once at startup.
-pub fn set_vram_budget(budget_mb: u64) {
-    metrics::gauge!("flarion_vram_budget_mb").set(budget_mb as f64);
+/// Set the `flarion_vram_budget_mb{gpu=...}` gauge. Call once per gpu at startup.
+pub fn set_vram_budget_on_gpu(gpu_id: u32, budget_mb: u64) {
+    metrics::gauge!(
+        "flarion_vram_budget_mb",
+        "gpu" => gpu_id.to_string(),
+    )
+    .set(budget_mb as f64);
 }
 
-/// Set the `flarion_vram_reserved_mb{model=...}` gauge for a model.
-pub fn set_vram_reserved(model_id: &str, mb: u64) {
-    metrics::gauge!("flarion_vram_reserved_mb", "model" => model_id.to_string()).set(mb as f64);
+/// Set the `flarion_vram_reserved_mb{model, gpu}` gauge.
+pub fn set_vram_reserved_on_gpu(model_id: &str, gpu_id: u32, mb: u64) {
+    metrics::gauge!(
+        "flarion_vram_reserved_mb",
+        "model" => model_id.to_string(),
+        "gpu" => gpu_id.to_string(),
+    )
+    .set(mb as f64);
 }
 
 /// GET /metrics handler — renders the current snapshot in Prometheus text format.

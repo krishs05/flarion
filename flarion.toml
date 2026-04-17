@@ -26,6 +26,10 @@ port = 8080
 # card with 2GB reserved for CUDA overhead).
 # vram_budget_mb = 22000
 
+# Per-device VRAM budget override. Keys are gpu_ids (u32), values are MB.
+# Wins over vram_budget_mb default. Useful for heterogeneous hardware.
+# vram_budget_overrides = { 0 = 22000, 1 = 16000 }
+
 # Local llama.cpp model
 [[models]]
 id = "my-model"
@@ -43,6 +47,13 @@ gpu_layers = 99
 # vram_mb = 6000
 # Never evict this model under budget pressure. Local backends only.
 # pin = true
+# GPU placement for local backends:
+# - omit or []    = auto-placement (scheduler best-fits at first load)
+# - [N]           = pin to device N
+# - [N, M, ...]   = tensor-parallel split across those devices
+# gpus = []
+# gpus = [0]
+# gpus = [0, 1, 2, 3]
 
 # Example: OpenAI cloud backend
 # [[models]]

@@ -182,6 +182,12 @@ pub struct ServerConfig {
     /// Only honored when `vram_budget_mb = "auto"`. Default 2048 MB.
     #[serde(default = "default_vram_headroom_mb")]
     pub vram_budget_headroom_mb: u64,
+
+    /// Per-device VRAM budget override. Keys are gpu_ids, values are MB.
+    /// An override wins over the default derived from `vram_budget_mb`
+    /// (whether Auto or Fixed). Unlisted devices use the default.
+    #[serde(default)]
+    pub vram_budget_overrides: std::collections::HashMap<u32, u64>,
 }
 
 impl Default for ServerConfig {
@@ -196,6 +202,7 @@ impl Default for ServerConfig {
             allow_plaintext_upstream: false,
             vram_budget_mb: VramBudgetSetting::Fixed(0),
             vram_budget_headroom_mb: default_vram_headroom_mb(),
+            vram_budget_overrides: std::collections::HashMap::new(),
         }
     }
 }
@@ -256,6 +263,64 @@ impl ServerConfig {
         }
         Ok(info.total_mb - headroom_mb)
     }
+
+    /// Resolve per-device VRAM budgets. Returns a `Vec<u64>` of length
+    /// `device_count`, indexed by gpu_id.
+    ///
+    /// - `Fixed(n)`: returns `vec![n; declared_device_count]`.
+    ///   Caller passes `declared_device_count` computed from
+    ///   `max(1, 1 + max_gpu_id_referenced_in_models)`.
+    /// - `Auto`: calls `detect_all_devices()`, ignores
+    ///   `declared_device_count`, and returns one budget per detected
+    ///   device (`total_mb - headroom`).
+    ///   Applies `vram_budget_overrides` on top; an override for a gpu_id
+    ///   beyond the device count → `VramOverrideUnknownGpu`.
+    pub fn resolve_vram_budgets(
+        &self,
+        declared_device_count: u32,
+    ) -> Result<Vec<u64>, ConfigError> {
+        let mut budgets: Vec<u64> = match self.vram_budget_mb {
+            VramBudgetSetting::Fixed(n) => {
+                vec![n; declared_device_count as usize]
+            }
+            VramBudgetSetting::Auto => {
+                let infos = crate::engine::vram_detect::detect_all_devices()
+                    .map_err(|source| ConfigError::VramAutoDetectFailed { source })?;
+                let mut out = Vec::with_capacity(infos.len());
+                for info in &infos {
+                    let b = Self::resolve_vram_budget_mb_from_info(
+                        info,
+                        self.vram_budget_headroom_mb,
+                    )?;
+                    tracing::info!(
+                        budget_mb = b,
+                        source = "auto",
+                        device = info.device_index,
+                        total_mb = info.total_mb,
+                        headroom_mb = self.vram_budget_headroom_mb,
+                        "vram budget resolved (per-device)"
+                    );
+                    out.push(b);
+                }
+                out
+            }
+        };
+
+        let device_count = budgets.len() as u32;
+
+        // Apply per-device overrides.
+        for (&gpu_id, &mb) in &self.vram_budget_overrides {
+            if gpu_id >= device_count {
+                return Err(ConfigError::VramOverrideUnknownGpu {
+                    gpu_id,
+                    device_count,
+                });
+            }
+            budgets[gpu_id as usize] = mb;
+        }
+
+        Ok(budgets)
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -276,9 +341,7 @@ pub struct ModelConfig {
     // Cloud-only
     pub api_key: Option<String>,
     pub base_url: Option<String>,
-    #[allow(dead_code)]
     pub upstream_model: Option<String>,
-    #[allow(dead_code)]
     pub timeout_secs: Option<u64>,
 
     /// Upper bound on `max_tokens` for this model (silent clamp). `None` →
@@ -299,6 +362,13 @@ pub struct ModelConfig {
     /// only. Pinned models count against `vram_budget_mb` at startup.
     #[serde(default)]
     pub pin: bool,
+
+    /// GPU placement for local backends.
+    /// - `[]` (default) = auto-placement (scheduler best-fits at first load).
+    /// - `[N]` = pin to device N.
+    /// - `[N, M, ...]` (len ≥ 2) = tensor-parallel split across those devices.
+    #[serde(default)]
+    pub gpus: Vec<u32>,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
@@ -310,12 +380,6 @@ pub enum BackendType {
     Anthropic,
 }
 
-#[allow(dead_code)]
-impl BackendType {
-    pub fn is_local(&self) -> bool {
-        matches!(self, BackendType::Local)
-    }
-}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LoggingConfig {
@@ -617,61 +681,148 @@ impl FlarionConfig {
                     backend: m.backend.clone(),
                 });
             }
-        }
-
-        let raw_budget_mb = match self.server.vram_budget_mb {
-            VramBudgetSetting::Fixed(n) => n,
-            VramBudgetSetting::Auto => 0, // Auto defers to runtime; skip static eager/pinned checks here.
-        };
-
-        if raw_budget_mb > 0 {
-            // Eager local models — lazy models may not all be resident.
-            let mut total_mb: u64 = 0;
-            let mut offenders: Vec<(String, u64)> = Vec::new();
-            for m in &self.models {
-                if m.backend != BackendType::Local || m.lazy {
-                    continue;
-                }
-                let path = m.path.as_ref().expect("local backend path must be set");
-                let est = crate::engine::scheduling::estimate_vram_mb(path, m.vram_mb)
-                    .map_err(|e| match e {
-                        crate::engine::scheduling::EstimateError::StatFailed { path, source } => {
-                            ConfigError::VramEstimateFailed { id: m.id.clone(), path, source }
-                        }
-                    })?;
-                total_mb = total_mb.saturating_add(est);
-                offenders.push((m.id.clone(), est));
-            }
-            if total_mb > raw_budget_mb {
-                return Err(ConfigError::EagerLoadsExceedBudget {
-                    total_mb,
-                    budget_mb: raw_budget_mb,
-                    offenders,
+            if !m.gpus.is_empty() && m.backend != BackendType::Local {
+                return Err(ConfigError::GpuIdOnCloudBackend {
+                    id: m.id.clone(),
+                    gpus: m.gpus.clone(),
+                    backend: m.backend.clone(),
                 });
             }
-
-            // Pinned local models — both eager and lazy — must all fit.
-            let mut total_mb: u64 = 0;
-            let mut offenders: Vec<(String, u64)> = Vec::new();
-            for m in &self.models {
-                if m.backend != BackendType::Local || !m.pin {
-                    continue;
+            // Duplicate-gpu check.
+            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for &gpu_id in &m.gpus {
+                if !seen.insert(gpu_id) {
+                    return Err(ConfigError::GpuIdDuplicated {
+                        model_id: m.id.clone(),
+                        gpu_id,
+                    });
                 }
-                let path = m.path.as_ref().expect("local backend path must be set");
-                let est = crate::engine::scheduling::estimate_vram_mb(path, m.vram_mb)
-                    .map_err(|e| match e {
-                        crate::engine::scheduling::EstimateError::StatFailed { path, source } => {
-                            ConfigError::VramEstimateFailed { id: m.id.clone(), path, source }
-                        }
-                    })?;
-                total_mb = total_mb.saturating_add(est);
-                offenders.push((m.id.clone(), est));
             }
-            if total_mb > raw_budget_mb {
+        }
+
+        // Phase 2H: compute declared device count and per-device budgets.
+        let declared_device_count = self
+            .models
+            .iter()
+            .flat_map(|m| m.gpus.iter().copied())
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(1);
+
+        let budgets = self.server.resolve_vram_budgets(declared_device_count)?;
+        let device_count = budgets.len() as u32;
+
+        // Only validate gpu_ids for local backends (already filtered on
+        // backend type by GpuIdOnCloudBackend earlier).
+        for m in &self.models {
+            if m.backend != BackendType::Local {
+                continue;
+            }
+            for &gpu_id in &m.gpus {
+                if gpu_id >= device_count {
+                    return Err(ConfigError::GpuIdExceedsDetected {
+                        model_id: m.id.clone(),
+                        gpu_id,
+                        detected_count: device_count,
+                    });
+                }
+            }
+        }
+
+        // Per-device eager overflow check.
+        let mut eager_totals: std::collections::HashMap<u32, (u64, Vec<(String, u64)>)> =
+            std::collections::HashMap::new();
+        for m in &self.models {
+            if m.backend != BackendType::Local || m.lazy {
+                continue;
+            }
+            let path = m
+                .path
+                .as_ref()
+                .expect("local backend path must be set — earlier validation ensures this");
+            let est = crate::engine::scheduling::estimate_vram_mb(path, m.vram_mb)
+                .map_err(|e| match e {
+                    crate::engine::scheduling::EstimateError::StatFailed { path, source } => {
+                        ConfigError::VramEstimateFailed {
+                            id: m.id.clone(),
+                            path,
+                            source,
+                        }
+                    }
+                })?;
+            // Resolve placement. Models with gpus=[] are auto-placed — they
+            // don't yet know their device at validation time, so we skip
+            // them in per-device eager checks (runtime best-fit handles it).
+            let placement = crate::engine::scheduling::ResolvedPlacement::from_gpus(&m.gpus);
+            if let crate::engine::scheduling::ResolvedPlacement::Resolved(p) = placement {
+                for (gpu_id, cost) in p.per_device_cost(est) {
+                    let entry = eager_totals
+                        .entry(gpu_id)
+                        .or_insert((0, Vec::new()));
+                    entry.0 = entry.0.saturating_add(cost);
+                    entry.1.push((m.id.clone(), cost));
+                }
+            }
+        }
+        // Find any gpu where eager total > budget. Deterministic order by gpu_id.
+        let mut eager_gpus: Vec<u32> = eager_totals.keys().copied().collect();
+        eager_gpus.sort();
+        for gpu_id in eager_gpus {
+            let (total_mb, offenders) = &eager_totals[&gpu_id];
+            let budget_mb = budgets[gpu_id as usize];
+            if budget_mb > 0 && *total_mb > budget_mb {
+                return Err(ConfigError::EagerLoadsExceedBudget {
+                    gpu_id,
+                    total_mb: *total_mb,
+                    budget_mb,
+                    offenders: offenders.clone(),
+                });
+            }
+        }
+
+        // Per-device pinned overflow check.
+        let mut pinned_totals: std::collections::HashMap<u32, (u64, Vec<(String, u64)>)> =
+            std::collections::HashMap::new();
+        for m in &self.models {
+            if m.backend != BackendType::Local || !m.pin {
+                continue;
+            }
+            let path = m
+                .path
+                .as_ref()
+                .expect("local backend path must be set — earlier validation ensures this");
+            let est = crate::engine::scheduling::estimate_vram_mb(path, m.vram_mb)
+                .map_err(|e| match e {
+                    crate::engine::scheduling::EstimateError::StatFailed { path, source } => {
+                        ConfigError::VramEstimateFailed {
+                            id: m.id.clone(),
+                            path,
+                            source,
+                        }
+                    }
+                })?;
+            let placement = crate::engine::scheduling::ResolvedPlacement::from_gpus(&m.gpus);
+            if let crate::engine::scheduling::ResolvedPlacement::Resolved(p) = placement {
+                for (gpu_id, cost) in p.per_device_cost(est) {
+                    let entry = pinned_totals
+                        .entry(gpu_id)
+                        .or_insert((0, Vec::new()));
+                    entry.0 = entry.0.saturating_add(cost);
+                    entry.1.push((m.id.clone(), cost));
+                }
+            }
+        }
+        let mut pinned_gpus: Vec<u32> = pinned_totals.keys().copied().collect();
+        pinned_gpus.sort();
+        for gpu_id in pinned_gpus {
+            let (total_mb, offenders) = &pinned_totals[&gpu_id];
+            let budget_mb = budgets[gpu_id as usize];
+            if budget_mb > 0 && *total_mb > budget_mb {
                 return Err(ConfigError::PinnedExceedsBudget {
-                    total_mb,
-                    budget_mb: raw_budget_mb,
-                    offenders,
+                    gpu_id,
+                    total_mb: *total_mb,
+                    budget_mb,
+                    offenders: offenders.clone(),
                 });
             }
         }
@@ -850,9 +1001,10 @@ pub enum ConfigError {
     VramMbOnlyForLocal { id: String, backend: BackendType },
 
     #[error(
-        "eager local models total {total_mb}MB, exceeds vram_budget_mb={budget_mb}; offenders: {offenders:?}"
+        "eager local models on gpu {gpu_id} total {total_mb}MB, exceeds budget={budget_mb}; offenders: {offenders:?}"
     )]
     EagerLoadsExceedBudget {
+        gpu_id: u32,
         total_mb: u64,
         budget_mb: u64,
         offenders: Vec<(String, u64)>,
@@ -872,12 +1024,27 @@ pub enum ConfigError {
     PinOnlyForLocal { id: String, backend: BackendType },
 
     #[error(
-        "pinned local models total {total_mb}MB, exceeds vram_budget_mb={budget_mb}; offenders: {offenders:?}"
+        "pinned local models on gpu {gpu_id} total {total_mb}MB, exceeds budget={budget_mb}; offenders: {offenders:?}"
     )]
     PinnedExceedsBudget {
+        gpu_id: u32,
         total_mb: u64,
         budget_mb: u64,
         offenders: Vec<(String, u64)>,
+    },
+
+    #[error(
+        "model '{model_id}' has duplicate gpu {gpu_id} in placement"
+    )]
+    GpuIdDuplicated { model_id: String, gpu_id: u32 },
+
+    #[error(
+        "model '{id}' has gpus={gpus:?} but backend={backend:?}; gpus is only supported for local backends"
+    )]
+    GpuIdOnCloudBackend {
+        id: String,
+        gpus: Vec<u32>,
+        backend: BackendType,
     },
 
     #[error("auto VRAM detection failed: {source}; set vram_budget_mb to an explicit integer MB or 0 to disable")]
@@ -888,6 +1055,20 @@ pub enum ConfigError {
 
     #[error("detected VRAM ({total_mb}MB) is <= headroom ({headroom_mb}MB); reduce vram_budget_headroom_mb")]
     VramAutoDetectInsufficient { total_mb: u64, headroom_mb: u64 },
+
+    #[error(
+        "vram_budget_overrides references gpu {gpu_id} but only {device_count} device(s) detected/declared"
+    )]
+    VramOverrideUnknownGpu { gpu_id: u32, device_count: u32 },
+
+    #[error(
+        "model '{model_id}' references gpu {gpu_id} but only {detected_count} device(s) detected"
+    )]
+    GpuIdExceedsDetected {
+        model_id: String,
+        gpu_id: u32,
+        detected_count: u32,
+    },
 }
 
 #[cfg(test)]
@@ -912,6 +1093,7 @@ mod tests {
             lazy: false,
             vram_mb: None,
             pin: false,
+            gpus: vec![],
         }
     }
 
@@ -933,6 +1115,7 @@ mod tests {
             lazy: false,
             vram_mb: None,
             pin: false,
+            gpus: vec![],
         }
     }
 
@@ -1226,6 +1409,7 @@ path = "/tmp/x.gguf"
                 lazy: false,
                 vram_mb: None,
                 pin: false,
+                gpus: vec![],
             }],
             logging: LoggingConfig::default(),
             ..FlarionConfig::default()
@@ -2227,6 +2411,7 @@ vram_mb = 6000
             lazy: true,
             vram_mb: None,
             pin: false,
+            gpus: vec![],
         }];
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::LazyOnlyForLocal { .. }));
@@ -2253,6 +2438,7 @@ vram_mb = 6000
             lazy: false,
             vram_mb: Some(1000),
             pin: false,
+            gpus: vec![],
         }];
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::VramMbOnlyForLocal { .. }));
@@ -2265,7 +2451,11 @@ vram_mb = 6000
         let mut cfg = FlarionConfig::default();
         cfg.server.host = "127.0.0.1".into();
         cfg.server.vram_budget_mb = VramBudgetSetting::Fixed(500);
-        cfg.models = vec![local_cfg("a", a_path), local_cfg("b", b_path)];
+        let mut a = local_cfg("a", a_path);
+        a.gpus = vec![0];
+        let mut b = local_cfg("b", b_path);
+        b.gpus = vec![0];
+        cfg.models = vec![a, b];
         // 100MB * 1.2 = 120MB each → 240MB total < 500MB budget.
         cfg.validate().unwrap();
     }
@@ -2278,19 +2468,24 @@ vram_mb = 6000
         let mut cfg = FlarionConfig::default();
         cfg.server.host = "127.0.0.1".into();
         cfg.server.vram_budget_mb = VramBudgetSetting::Fixed(500);
-        cfg.models = vec![
-            local_cfg("a", a_path),
-            local_cfg("b", b_path),
-            local_cfg("c", c_path),
-        ];
-        // Each ≈240MB, total ≈720MB > 500MB.
+        // Pin all three models to gpu 0 so per-device check applies.
+        let mut a = local_cfg("a", a_path);
+        a.gpus = vec![0];
+        let mut b = local_cfg("b", b_path);
+        b.gpus = vec![0];
+        let mut c = local_cfg("c", c_path);
+        c.gpus = vec![0];
+        cfg.models = vec![a, b, c];
+        // Each ≈240MB, total ≈720MB > 500MB on gpu 0.
         let err = cfg.validate().unwrap_err();
         match err {
             ConfigError::EagerLoadsExceedBudget {
+                gpu_id,
                 total_mb,
                 budget_mb,
                 offenders,
             } => {
+                assert_eq!(gpu_id, 0);
                 assert!(total_mb > 500, "total_mb={total_mb}");
                 assert_eq!(budget_mb, 500);
                 assert_eq!(offenders.len(), 3);
@@ -2311,9 +2506,12 @@ vram_mb = 6000
         let mut cfg = FlarionConfig::default();
         cfg.server.host = "127.0.0.1".into();
         cfg.server.vram_budget_mb = VramBudgetSetting::Fixed(300);
+        let mut eager_model = local_cfg("eager", a_path);
+        eager_model.gpus = vec![0];
         let mut lazy_model = local_cfg("lazy", b_path);
         lazy_model.lazy = true;
-        cfg.models = vec![local_cfg("eager", a_path), lazy_model];
+        // lazy_model.gpus stays vec![] (Auto) — correctly skipped by per-device check.
+        cfg.models = vec![eager_model, lazy_model];
         // Eager: 240MB < 300MB budget. Lazy excluded from sum.
         cfg.validate().unwrap();
     }
@@ -2368,6 +2566,7 @@ vram_mb = 6000
             lazy: false,
             vram_mb: None,
             pin: true,
+            gpus: vec![],
         }];
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -2378,7 +2577,7 @@ vram_mb = 6000
 
     #[test]
     fn test_validate_rejects_pinned_over_budget() {
-        // Each file is 200 MB → estimate ~240 MB. Three pinned models = ~720 MB.
+        // Each file is 200 MB → estimate ~240 MB. Three pinned models on gpu 0 = ~720 MB.
         let (_a_dir, a_path) = make_fake_gguf(200);
         let (_b_dir, b_path) = make_fake_gguf(200);
         let (_c_dir, c_path) = make_fake_gguf(200);
@@ -2386,6 +2585,7 @@ vram_mb = 6000
         let mut cfg = FlarionConfig::default();
         cfg.server.host = "127.0.0.1".into();
         cfg.server.vram_budget_mb = VramBudgetSetting::Fixed(500);
+        // Pin all three to gpu 0 so per-device check applies.
         cfg.models = vec![
             ModelConfig {
                 id: "a".into(),
@@ -2404,6 +2604,7 @@ vram_mb = 6000
                 lazy: true,
                 vram_mb: None,
                 pin: true,
+                gpus: vec![0],
             },
             ModelConfig {
                 id: "b".into(),
@@ -2422,6 +2623,7 @@ vram_mb = 6000
                 lazy: true,
                 vram_mb: None,
                 pin: true,
+                gpus: vec![0],
             },
             ModelConfig {
                 id: "c".into(),
@@ -2440,12 +2642,14 @@ vram_mb = 6000
                 lazy: true,
                 vram_mb: None,
                 pin: true,
+                gpus: vec![0],
             },
         ];
 
         let err = cfg.validate().unwrap_err();
         match err {
-            ConfigError::PinnedExceedsBudget { total_mb, budget_mb, offenders } => {
+            ConfigError::PinnedExceedsBudget { gpu_id, total_mb, budget_mb, offenders } => {
+                assert_eq!(gpu_id, 0);
                 assert!(total_mb > budget_mb, "total={total_mb} budget={budget_mb}");
                 assert_eq!(budget_mb, 500);
                 assert_eq!(offenders.len(), 3);
@@ -2546,5 +2750,315 @@ vram_mb = 6000
         let info = VramInfo { device_index: 0, total_mb: 24000, free_mb: 20000 };
         let got = ServerConfig::resolve_vram_budget_mb_from_info(&info, 2000).unwrap();
         assert_eq!(got, 22000);
+    }
+
+    #[test]
+    fn test_gpus_deserializes_default_empty() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            [[models]]
+            id = "m"
+            backend = "local"
+            path = "/tmp/m.gguf"
+        "#;
+        let cfg: FlarionConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.models[0].gpus.is_empty());
+    }
+
+    #[test]
+    fn test_gpus_deserializes_single_device() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            [[models]]
+            id = "m"
+            backend = "local"
+            path = "/tmp/m.gguf"
+            gpus = [2]
+        "#;
+        let cfg: FlarionConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.models[0].gpus, vec![2]);
+    }
+
+    #[test]
+    fn test_gpus_deserializes_tensor_split_list() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            [[models]]
+            id = "m"
+            backend = "local"
+            path = "/tmp/m.gguf"
+            gpus = [0, 1, 2]
+        "#;
+        let cfg: FlarionConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.models[0].gpus, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_gpu_in_gpus() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = {
+            let p = dir.path().join("m.gguf");
+            let f = std::fs::File::create(&p).unwrap();
+            f.set_len(100 * 1024 * 1024).unwrap();
+            drop(f);
+            p
+        };
+        let mut cfg = FlarionConfig::default();
+        cfg.server.host = "127.0.0.1".into();
+        cfg.models = vec![ModelConfig {
+            id: "m".into(),
+            backend: BackendType::Local,
+            path: Some(path),
+            context_size: 4096,
+            gpu_layers: 99,
+            threads: None,
+            batch_size: None,
+            seed: None,
+            api_key: None,
+            base_url: None,
+            upstream_model: None,
+            timeout_secs: None,
+            max_tokens_cap: None,
+            lazy: false,
+            vram_mb: None,
+            pin: false,
+            gpus: vec![0, 1, 0],
+        }];
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::GpuIdDuplicated { gpu_id: 0, .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_gpus_on_cloud_backend() {
+        let mut cfg = FlarionConfig::default();
+        cfg.server.host = "127.0.0.1".into();
+        cfg.models = vec![ModelConfig {
+            id: "openai-m".into(),
+            backend: BackendType::Openai,
+            path: None,
+            context_size: 4096,
+            gpu_layers: 99,
+            threads: None,
+            batch_size: None,
+            seed: None,
+            api_key: Some("k".into()),
+            base_url: Some("https://api.openai.com/v1".into()),
+            upstream_model: Some("gpt-4o".into()),
+            timeout_secs: None,
+            max_tokens_cap: None,
+            lazy: false,
+            vram_mb: None,
+            pin: false,
+            gpus: vec![0],
+        }];
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::GpuIdOnCloudBackend { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_vram_budget_overrides_deserializes() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            vram_budget_overrides = { 0 = 20000, 1 = 24000 }
+            [[models]]
+            id = "m"
+            backend = "local"
+            path = "/tmp/m.gguf"
+        "#;
+        let cfg: FlarionConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.server.vram_budget_overrides.get(&0), Some(&20000));
+        assert_eq!(cfg.server.vram_budget_overrides.get(&1), Some(&24000));
+    }
+
+    #[test]
+    fn test_vram_budget_overrides_defaults_to_empty() {
+        let toml = r#"
+            [server]
+            host = "127.0.0.1"
+            [[models]]
+            id = "m"
+            backend = "local"
+            path = "/tmp/m.gguf"
+        "#;
+        let cfg: FlarionConfig = toml::from_str(toml).unwrap();
+        assert!(cfg.server.vram_budget_overrides.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_budgets_fixed_mode_uniform() {
+        let server = ServerConfig {
+            vram_budget_mb: VramBudgetSetting::Fixed(22000),
+            ..ServerConfig::default()
+        };
+        let budgets = server.resolve_vram_budgets(2).unwrap();
+        assert_eq!(budgets, vec![22000, 22000]);
+    }
+
+    #[test]
+    fn test_resolve_budgets_fixed_mode_single_device_default() {
+        let server = ServerConfig {
+            vram_budget_mb: VramBudgetSetting::Fixed(22000),
+            ..ServerConfig::default()
+        };
+        let budgets = server.resolve_vram_budgets(1).unwrap();
+        assert_eq!(budgets, vec![22000]);
+    }
+
+    #[test]
+    fn test_resolve_budgets_override_wins() {
+        let server = ServerConfig {
+            vram_budget_mb: VramBudgetSetting::Fixed(22000),
+            vram_budget_overrides: [(0u32, 20000u64)].into_iter().collect(),
+            ..ServerConfig::default()
+        };
+        let budgets = server.resolve_vram_budgets(2).unwrap();
+        assert_eq!(budgets, vec![20000, 22000]);
+    }
+
+    #[test]
+    fn test_resolve_budgets_rejects_override_unknown_gpu() {
+        let server = ServerConfig {
+            vram_budget_mb: VramBudgetSetting::Fixed(22000),
+            vram_budget_overrides: [(3u32, 10000u64)].into_iter().collect(),
+            ..ServerConfig::default()
+        };
+        let err = server.resolve_vram_budgets(2).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::VramOverrideUnknownGpu { gpu_id: 3, device_count: 2 }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_budgets_fixed_zero_passes_through_per_device() {
+        let server = ServerConfig::default();
+        let budgets = server.resolve_vram_budgets(2).unwrap();
+        assert_eq!(budgets, vec![0, 0]);
+    }
+
+    #[test]
+    fn test_validate_rejects_eager_overflow_on_single_gpu_out_of_many() {
+        let dir = tempfile::tempdir().unwrap();
+        // 400 MB file → estimate 480 MB. Three of them → ~1440 MB on gpu 0.
+        let mk = |name: &str| {
+            let p = dir.path().join(name);
+            let f = std::fs::File::create(&p).unwrap();
+            f.set_len(400 * 1024 * 1024).unwrap();
+            drop(f);
+            p
+        };
+        fn eager_on_gpu(id: &str, path: std::path::PathBuf, gpu: u32) -> ModelConfig {
+            ModelConfig {
+                id: id.into(),
+                backend: BackendType::Local,
+                path: Some(path),
+                context_size: 4096,
+                gpu_layers: 99,
+                threads: None,
+                batch_size: None,
+                seed: None,
+                api_key: None,
+                base_url: None,
+                upstream_model: None,
+                timeout_secs: None,
+                max_tokens_cap: None,
+                lazy: false,
+                vram_mb: None,
+                pin: false,
+                gpus: vec![gpu],
+            }
+        }
+
+        let mut cfg = FlarionConfig::default();
+        cfg.server.host = "127.0.0.1".into();
+        cfg.server.vram_budget_mb = VramBudgetSetting::Fixed(1000);
+        cfg.models = vec![
+            eager_on_gpu("a", mk("a.gguf"), 0),
+            eager_on_gpu("b", mk("b.gguf"), 0),
+            eager_on_gpu("c", mk("c.gguf"), 0),
+        ];
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigError::EagerLoadsExceedBudget {
+                gpu_id,
+                total_mb,
+                budget_mb,
+                ..
+            } => {
+                assert_eq!(gpu_id, 0);
+                assert!(total_mb > budget_mb);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_pinned_overflow_with_split_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let mk = |name: &str, mb_on_disk: u64| {
+            let p = dir.path().join(name);
+            let f = std::fs::File::create(&p).unwrap();
+            f.set_len(mb_on_disk * 1024 * 1024).unwrap();
+            drop(f);
+            p
+        };
+        fn pinned_lazy(id: &str, path: std::path::PathBuf, gpus: Vec<u32>) -> ModelConfig {
+            ModelConfig {
+                id: id.into(),
+                backend: BackendType::Local,
+                path: Some(path),
+                context_size: 4096,
+                gpu_layers: 99,
+                threads: None,
+                batch_size: None,
+                seed: None,
+                api_key: None,
+                base_url: None,
+                upstream_model: None,
+                timeout_secs: None,
+                max_tokens_cap: None,
+                lazy: true,
+                vram_mb: None,
+                pin: true,
+                gpus,
+            }
+        }
+
+        // Split model 10000 MB across gpus [0, 1] → 5000 MB each.
+        // Single-device pinned 6000 MB on gpu 0.
+        // Total on gpu 0: 11000 MB. Budget: 10000 → overflow on gpu 0.
+        let mut cfg = FlarionConfig::default();
+        cfg.server.host = "127.0.0.1".into();
+        cfg.server.vram_budget_mb = VramBudgetSetting::Fixed(10000);
+        let mut split = pinned_lazy("split", mk("split.gguf", 100), vec![0, 1]);
+        split.vram_mb = Some(10000);
+        let mut single = pinned_lazy("single", mk("single.gguf", 100), vec![0]);
+        single.vram_mb = Some(6000);
+        cfg.models = vec![split, single];
+
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigError::PinnedExceedsBudget {
+                gpu_id, total_mb, budget_mb, ..
+            } => {
+                assert_eq!(gpu_id, 0);
+                assert_eq!(total_mb, 11000);
+                assert_eq!(budget_mb, 10000);
+            }
+            other => panic!("got {other:?}"),
+        }
     }
 }

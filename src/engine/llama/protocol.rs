@@ -6,8 +6,13 @@ use crate::error::EngineError;
 /// Commands sent from `LlamaBackend` (async side) to the worker OS thread.
 pub(super) enum WorkerCommand {
     /// Load the GGUF model into memory. Sent exactly once, as the first
-    /// command after the worker thread spawns.
+    /// command after the worker thread spawns. Placement args apply to
+    /// the underlying `LlamaModelParams` via `with_main_gpu`,
+    /// `with_split_mode`, and `with_devices`.
     Load {
+        main_gpu: u32,
+        devices: Vec<usize>,
+        split_mode: llama_cpp_2::model::params::LlamaSplitMode,
         ack: oneshot::Sender<Result<(), EngineError>>,
     },
 

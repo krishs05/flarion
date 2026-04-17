@@ -25,15 +25,20 @@ pub(super) fn run<M: ModelAdapter>(
     mut adapter: M,
 ) {
     // First command must be Load. Anything else is a caller-side API misuse.
-    let load_ack = match cmd_rx.blocking_recv() {
-        Some(WorkerCommand::Load { ack }) => ack,
+    let (load_main_gpu, load_devices, load_split_mode, load_ack) = match cmd_rx.blocking_recv() {
+        Some(WorkerCommand::Load {
+            main_gpu,
+            devices,
+            split_mode,
+            ack,
+        }) => (main_gpu, devices, split_mode, ack),
         Some(_) | None => {
             error!("worker: first command was not Load or channel closed");
             return;
         }
     };
 
-    match adapter.load(&config) {
+    match adapter.load(&config, load_main_gpu, &load_devices, load_split_mode) {
         Ok(()) => {
             let _ = load_ack.send(Ok(()));
             crate::metrics::set_backend_poisoned(&config.id, false);
@@ -236,6 +241,15 @@ mod tests {
     use std::path::PathBuf;
     use tokio::sync::oneshot;
 
+    fn load_cmd(ack: oneshot::Sender<Result<(), EngineError>>) -> WorkerCommand {
+        WorkerCommand::Load {
+            main_gpu: 0,
+            devices: vec![],
+            split_mode: llama_cpp_2::model::params::LlamaSplitMode::None,
+            ack,
+        }
+    }
+
     fn test_config() -> ModelConfig {
         ModelConfig {
             id: "test-model".into(),
@@ -254,6 +268,7 @@ mod tests {
             lazy: false,
             vram_mb: None,
             pin: false,
+            gpus: vec![],
         }
     }
 
@@ -281,7 +296,7 @@ mod tests {
 
         let (ack_tx, ack_rx) = oneshot::channel();
         cmd_tx
-            .send(WorkerCommand::Load { ack: ack_tx })
+            .send(load_cmd(ack_tx))
             .await
             .unwrap();
         let result = ack_rx.await.unwrap();
@@ -304,7 +319,7 @@ mod tests {
 
         let (ack_tx, ack_rx) = oneshot::channel();
         cmd_tx
-            .send(WorkerCommand::Load { ack: ack_tx })
+            .send(load_cmd(ack_tx))
             .await
             .unwrap();
         let result = ack_rx.await.unwrap();
@@ -329,7 +344,7 @@ mod tests {
 
         let (load_tx, load_rx) = oneshot::channel();
         cmd_tx
-            .send(WorkerCommand::Load { ack: load_tx })
+            .send(load_cmd(load_tx))
             .await
             .unwrap();
         load_rx.await.unwrap().unwrap();
@@ -381,7 +396,7 @@ mod tests {
 
         let (load_tx, load_rx) = oneshot::channel();
         cmd_tx
-            .send(WorkerCommand::Load { ack: load_tx })
+            .send(load_cmd(load_tx))
             .await
             .unwrap();
         load_rx.await.unwrap().unwrap();
@@ -448,7 +463,7 @@ mod tests {
 
         let (load_tx, load_rx) = oneshot::channel();
         cmd_tx
-            .send(WorkerCommand::Load { ack: load_tx })
+            .send(load_cmd(load_tx))
             .await
             .unwrap();
         load_rx.await.unwrap().unwrap();
@@ -516,7 +531,7 @@ mod tests {
 
         let (load_tx, load_rx) = oneshot::channel();
         cmd_tx
-            .send(WorkerCommand::Load { ack: load_tx })
+            .send(load_cmd(load_tx))
             .await
             .unwrap();
         load_rx.await.unwrap().unwrap();
@@ -581,7 +596,7 @@ mod tests {
 
         let (load_tx, load_rx) = oneshot::channel();
         cmd_tx
-            .send(WorkerCommand::Load { ack: load_tx })
+            .send(load_cmd(load_tx))
             .await
             .unwrap();
         load_rx.await.unwrap().unwrap();

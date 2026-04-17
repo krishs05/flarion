@@ -13,6 +13,80 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex};
 
+pub use llama_cpp_2::model::params::LlamaSplitMode;
+
+/// Concrete placement for a loaded model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Placement {
+    SingleDevice(u32),
+    TensorSplit {
+        gpus: Vec<u32>, // device ids, length >= 2
+    },
+}
+
+/// Placement state on a `LlamaBackend`. `Auto` defers to the scheduler's
+/// best-fit selection at first load.
+#[derive(Debug, Clone)]
+pub enum ResolvedPlacement {
+    Auto,
+    Resolved(Placement),
+}
+
+impl ResolvedPlacement {
+    /// Parse the raw `gpus: Vec<u32>` config field into a resolved state.
+    /// - `[]` → Auto
+    /// - `[N]` → Resolved(SingleDevice(N))
+    /// - `[N, M, ...]` (len ≥ 2) → Resolved(TensorSplit { gpus })
+    pub fn from_gpus(gpus: &[u32]) -> Self {
+        match gpus.len() {
+            0 => ResolvedPlacement::Auto,
+            1 => ResolvedPlacement::Resolved(Placement::SingleDevice(gpus[0])),
+            _ => ResolvedPlacement::Resolved(Placement::TensorSplit {
+                gpus: gpus.to_vec(),
+            }),
+        }
+    }
+}
+
+impl Placement {
+    /// Flat list of gpu_ids this placement touches.
+    pub fn gpus(&self) -> &[u32] {
+        match self {
+            Placement::SingleDevice(n) => std::slice::from_ref(n),
+            Placement::TensorSplit { gpus } => gpus,
+        }
+    }
+
+    /// Per-device cost contribution for a given total model estimate.
+    /// Uses a uniform split heuristic with remainder on the first device.
+    pub fn per_device_cost(&self, total_mb: u64) -> Vec<(u32, u64)> {
+        match self {
+            Placement::SingleDevice(n) => vec![(*n, total_mb)],
+            Placement::TensorSplit { gpus } => {
+                let n = gpus.len() as u64;
+                let base = total_mb / n;
+                let remainder = total_mb - base * n;
+                gpus.iter()
+                    .enumerate()
+                    .map(|(i, &g)| (g, if i == 0 { base + remainder } else { base }))
+                    .collect()
+            }
+        }
+    }
+
+    /// Corresponding llama-cpp-2 load arguments: (main_gpu, devices, split_mode).
+    pub fn to_llama_args(&self) -> (u32, Vec<usize>, LlamaSplitMode) {
+        match self {
+            Placement::SingleDevice(n) => (*n, vec![*n as usize], LlamaSplitMode::None),
+            Placement::TensorSplit { gpus } => (
+                gpus[0],
+                gpus.iter().map(|&g| g as usize).collect(),
+                LlamaSplitMode::Layer,
+            ),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ResidentEntry {
     cost_mb: u64,
@@ -172,6 +246,127 @@ impl ResidentSet {
     }
 }
 
+/// Shared context for reservations — the handles and metadata every
+/// per-device entry needs. One `ReservationContext` drives N per-device
+/// `ReservationRequest`s during a multi-device reservation.
+pub struct ReservationContext<'a> {
+    pub model_id: &'a str,
+    pub pinned: bool,
+    pub last_used_ms: Arc<AtomicU64>,
+    pub in_flight: Arc<AtomicU32>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SchedulerError {
+    #[error("VRAM over budget on gpu {gpu_id}: {inner}")]
+    OverBudget {
+        gpu_id: u32,
+        #[source]
+        inner: ResidentError,
+    },
+    #[error("scheduler target gpu {gpu_id} is not configured")]
+    UnknownGpu { gpu_id: u32 },
+    #[error("resident set for gpu {gpu_id} poisoned")]
+    Poisoned { gpu_id: u32 },
+}
+
+/// Multi-device VRAM scheduler. Owns one `ResidentSet` per GPU.
+pub struct Scheduler {
+    sets: Vec<Arc<ResidentSet>>,
+}
+
+impl Scheduler {
+    /// Build a scheduler with one `ResidentSet` per entry in `budgets`.
+    /// `budgets[i]` is the budget (MB) for gpu_id = i. Passing an empty
+    /// `Vec` creates a scheduler with zero devices.
+    pub fn new(budgets: Vec<u64>) -> Arc<Self> {
+        let sets = budgets.into_iter().map(ResidentSet::new).collect();
+        Arc::new(Self { sets })
+    }
+
+    pub fn device_count(&self) -> u32 {
+        self.sets.len() as u32
+    }
+
+    pub fn set(&self, gpu_id: u32) -> Option<Arc<ResidentSet>> {
+        self.sets.get(gpu_id as usize).cloned()
+    }
+
+    /// Returns the gpu_id with the most free budget. Used by
+    /// auto-placement: callers don't filter by "fits now" — if the
+    /// chosen device doesn't have enough room, the normal
+    /// reserve+evict loop handles it. Returns `None` only when
+    /// `device_count == 0`.
+    pub fn pick_most_free_device(&self) -> Option<u32> {
+        self.sets
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let free = s.budget_mb().saturating_sub(s.total_reserved_mb());
+                (i as u32, free)
+            })
+            .max_by_key(|(_, free)| *free)
+            .map(|(id, _)| id)
+    }
+
+    /// Atomic-ish multi-device reservation. Iterates `per_device_costs`
+    /// in order; on any per-device failure, rolls back prior reservations
+    /// made in this call and returns the underlying error.
+    pub fn try_reserve_split(
+        &self,
+        per_device_costs: &[(u32, u64)],
+        ctx: ReservationContext<'_>,
+    ) -> Result<(), SchedulerError> {
+        let mut reserved: Vec<u32> = Vec::with_capacity(per_device_costs.len());
+        for &(gpu_id, cost_mb) in per_device_costs {
+            let Some(set) = self.set(gpu_id) else {
+                for &id in &reserved {
+                    if let Some(s) = self.set(id) {
+                        s.release(ctx.model_id);
+                    }
+                }
+                return Err(SchedulerError::UnknownGpu { gpu_id });
+            };
+            let req = ReservationRequest {
+                model_id: ctx.model_id,
+                cost_mb,
+                pinned: ctx.pinned,
+                last_used_ms: ctx.last_used_ms.clone(),
+                in_flight: ctx.in_flight.clone(),
+            };
+            match set.try_reserve(req) {
+                Ok(()) => {
+                    reserved.push(gpu_id);
+                }
+                Err(e) => {
+                    for &id in &reserved {
+                        if let Some(s) = self.set(id) {
+                            s.release(ctx.model_id);
+                        }
+                    }
+                    return Err(match e {
+                        ResidentError::Poisoned => SchedulerError::Poisoned { gpu_id },
+                        other => SchedulerError::OverBudget {
+                            gpu_id,
+                            inner: other,
+                        },
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Release the model's reservation on every gpu_id in `gpu_ids`.
+    pub fn release(&self, model_id: &str, gpu_ids: &[u32]) {
+        for &id in gpu_ids {
+            if let Some(s) = self.set(id) {
+                s.release(model_id);
+            }
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EstimateError {
     #[error("failed to stat {path}: {source}")]
@@ -203,6 +398,80 @@ pub fn estimate_vram_mb(path: &Path, override_mb: Option<u64>) -> Result<u64, Es
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{Placement, ResolvedPlacement};
+    use llama_cpp_2::model::params::LlamaSplitMode;
+
+    #[test]
+    fn placement_from_gpus_empty_produces_auto() {
+        let rp = ResolvedPlacement::from_gpus(&[]);
+        assert!(matches!(rp, ResolvedPlacement::Auto));
+    }
+
+    #[test]
+    fn placement_from_gpus_single_produces_single_device() {
+        let rp = ResolvedPlacement::from_gpus(&[3]);
+        match rp {
+            ResolvedPlacement::Resolved(Placement::SingleDevice(n)) => assert_eq!(n, 3),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn placement_from_gpus_multi_produces_tensor_split() {
+        let rp = ResolvedPlacement::from_gpus(&[0, 1]);
+        match rp {
+            ResolvedPlacement::Resolved(Placement::TensorSplit { gpus }) => {
+                assert_eq!(gpus, vec![0, 1]);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn placement_per_device_cost_single_device() {
+        let p = Placement::SingleDevice(2);
+        assert_eq!(p.per_device_cost(1000), vec![(2, 1000)]);
+    }
+
+    #[test]
+    fn placement_per_device_cost_split_uniform() {
+        let p = Placement::TensorSplit { gpus: vec![0, 1] };
+        assert_eq!(p.per_device_cost(10000), vec![(0, 5000), (1, 5000)]);
+    }
+
+    #[test]
+    fn placement_per_device_cost_split_remainder_on_first() {
+        // Uneven total: 1001 / 3 = 333 r 2. First gets 335, rest get 333.
+        let p = Placement::TensorSplit { gpus: vec![0, 1, 2] };
+        assert_eq!(p.per_device_cost(1001), vec![(0, 335), (1, 333), (2, 333)]);
+    }
+
+    #[test]
+    fn placement_to_llama_args_single_device() {
+        let p = Placement::SingleDevice(1);
+        let (main_gpu, devices, mode) = p.to_llama_args();
+        assert_eq!(main_gpu, 1);
+        assert_eq!(devices, vec![1usize]);
+        assert!(matches!(mode, LlamaSplitMode::None));
+    }
+
+    #[test]
+    fn placement_to_llama_args_tensor_split() {
+        let p = Placement::TensorSplit { gpus: vec![0, 1, 2] };
+        let (main_gpu, devices, mode) = p.to_llama_args();
+        assert_eq!(main_gpu, 0);
+        assert_eq!(devices, vec![0usize, 1, 2]);
+        assert!(matches!(mode, LlamaSplitMode::Layer));
+    }
+
+    #[test]
+    fn placement_gpus_returns_all_target_devices() {
+        assert_eq!(Placement::SingleDevice(3).gpus(), &[3][..]);
+        assert_eq!(
+            Placement::TensorSplit { gpus: vec![0, 1] }.gpus(),
+            &[0, 1][..]
+        );
+    }
 
     fn mk_req(model_id: &str, cost_mb: u64) -> ReservationRequest<'_> {
         use std::sync::atomic::{AtomicU32, AtomicU64};
@@ -457,5 +726,121 @@ mod tests {
         in_flight_a.store(1, AOrd::Release);
         let victims = set.pick_eviction_candidates(3000).unwrap();
         assert_eq!(victims, vec!["b".to_string()]);
+    }
+
+    // ── Scheduler tests ──────────────────────────────────────────────────────
+
+    use super::{Scheduler, SchedulerError};
+
+    fn mk_ctx<'a>(
+        model_id: &'a str,
+        pinned: bool,
+    ) -> super::ReservationContext<'a> {
+        super::ReservationContext {
+            model_id,
+            pinned,
+            last_used_ms: Arc::new(AtomicU64::new(0)),
+            in_flight: Arc::new(AtomicU32::new(0)),
+        }
+    }
+
+    #[test]
+    fn scheduler_picks_device_with_most_free_budget() {
+        let sched = Scheduler::new(vec![5000, 8000]);
+        assert_eq!(sched.pick_most_free_device(), Some(1));
+    }
+
+    #[test]
+    fn scheduler_picks_least_loaded_across_unequal_budgets() {
+        // Device 0: budget 20000, reserve 19000 → free 1000.
+        // Device 1: budget 10000, reserve 2000 → free 8000.
+        let sched = Scheduler::new(vec![20000, 10000]);
+        sched
+            .set(0)
+            .unwrap()
+            .try_reserve(ReservationRequest {
+                model_id: "big",
+                cost_mb: 19000,
+                pinned: false,
+                last_used_ms: Arc::new(AtomicU64::new(0)),
+                in_flight: Arc::new(AtomicU32::new(0)),
+            })
+            .unwrap();
+        sched
+            .set(1)
+            .unwrap()
+            .try_reserve(ReservationRequest {
+                model_id: "small",
+                cost_mb: 2000,
+                pinned: false,
+                last_used_ms: Arc::new(AtomicU64::new(0)),
+                in_flight: Arc::new(AtomicU32::new(0)),
+            })
+            .unwrap();
+        assert_eq!(sched.pick_most_free_device(), Some(1));
+    }
+
+    #[test]
+    fn scheduler_returns_none_when_no_devices() {
+        let sched = Scheduler::new(vec![]);
+        assert_eq!(sched.pick_most_free_device(), None);
+        assert_eq!(sched.device_count(), 0);
+    }
+
+    #[test]
+    fn scheduler_try_reserve_split_succeeds_across_devices() {
+        let sched = Scheduler::new(vec![10000, 10000]);
+        let per_device = vec![(0, 5000), (1, 5000)];
+        sched.try_reserve_split(&per_device, mk_ctx("big", false)).unwrap();
+        assert_eq!(sched.set(0).unwrap().total_reserved_mb(), 5000);
+        assert_eq!(sched.set(1).unwrap().total_reserved_mb(), 5000);
+    }
+
+    #[test]
+    fn scheduler_try_reserve_split_rollback_on_partial_failure() {
+        // Fill device 1 so the second reserve fails.
+        let sched = Scheduler::new(vec![10000, 1000]);
+        sched
+            .set(1)
+            .unwrap()
+            .try_reserve(ReservationRequest {
+                model_id: "filler",
+                cost_mb: 900,
+                pinned: false,
+                last_used_ms: Arc::new(AtomicU64::new(0)),
+                in_flight: Arc::new(AtomicU32::new(0)),
+            })
+            .unwrap();
+
+        // Try to reserve 5000 on 0 + 5000 on 1. First succeeds, second fails.
+        let per_device = vec![(0, 5000), (1, 5000)];
+        let err = sched
+            .try_reserve_split(&per_device, mk_ctx("big", false))
+            .unwrap_err();
+        assert!(matches!(err, SchedulerError::OverBudget { gpu_id: 1, .. }));
+
+        // Device 0 should be back to 0 reserved (rolled back).
+        assert_eq!(sched.set(0).unwrap().total_reserved_mb(), 0);
+        // Device 1 still has the filler.
+        assert_eq!(sched.set(1).unwrap().total_reserved_mb(), 900);
+    }
+
+    #[test]
+    fn scheduler_try_reserve_split_unknown_gpu() {
+        let sched = Scheduler::new(vec![10000]);
+        let per_device = vec![(5, 1000)]; // gpu 5 doesn't exist
+        let err = sched
+            .try_reserve_split(&per_device, mk_ctx("m", false))
+            .unwrap_err();
+        assert!(matches!(err, SchedulerError::UnknownGpu { gpu_id: 5 }));
+    }
+
+    #[test]
+    fn scheduler_release_iterates_gpu_ids() {
+        let sched = Scheduler::new(vec![10000, 10000]);
+        sched.try_reserve_split(&[(0, 5000), (1, 5000)], mk_ctx("big", false)).unwrap();
+        sched.release("big", &[0, 1]);
+        assert_eq!(sched.set(0).unwrap().total_reserved_mb(), 0);
+        assert_eq!(sched.set(1).unwrap().total_reserved_mb(), 0);
     }
 }

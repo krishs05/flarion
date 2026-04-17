@@ -22,17 +22,51 @@ pub enum VramDetectError {
     QueryFailed(#[source] nvml_wrapper::error::NvmlError),
 }
 
-pub fn detect_device_zero() -> Result<VramInfo, VramDetectError> {
+/// Query every CUDA device visible to NVML. Returns a `Vec<VramInfo>`
+/// in device-index order. On hosts without an NVIDIA driver, returns
+/// `VramDetectError::NvmlInit`.
+pub fn detect_all_devices() -> Result<Vec<VramInfo>, VramDetectError> {
     let nvml = nvml_wrapper::Nvml::init().map_err(VramDetectError::NvmlInit)?;
     let count = nvml.device_count().map_err(VramDetectError::QueryFailed)?;
     if count == 0 {
         return Err(VramDetectError::NoDevices);
     }
-    let dev = nvml.device_by_index(0).map_err(VramDetectError::QueryFailed)?;
-    let mem = dev.memory_info().map_err(VramDetectError::QueryFailed)?;
-    Ok(VramInfo {
-        device_index: 0,
-        total_mb: mem.total / (1024 * 1024),
-        free_mb: mem.free / (1024 * 1024),
-    })
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let dev = nvml
+            .device_by_index(i)
+            .map_err(VramDetectError::QueryFailed)?;
+        let mem = dev.memory_info().map_err(VramDetectError::QueryFailed)?;
+        out.push(VramInfo {
+            device_index: i,
+            total_mb: mem.total / (1024 * 1024),
+            free_mb: mem.free / (1024 * 1024),
+        });
+    }
+    Ok(out)
+}
+
+/// Backward-compatible single-device accessor. Returns the first device
+/// from `detect_all_devices`.
+pub fn detect_device_zero() -> Result<VramInfo, VramDetectError> {
+    detect_all_devices()?
+        .into_iter()
+        .next()
+        .ok_or(VramDetectError::NoDevices)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_device_zero_delegates_to_all_devices_first() {
+        // This test exists only to assert that detect_device_zero is
+        // still exported and returns the same VramInfo shape. It calls
+        // NVML — on non-NVIDIA CI the Err path is exercised instead.
+        let res = detect_device_zero();
+        if let Ok(info) = res {
+            assert_eq!(info.device_index, 0);
+        }
+    }
 }

@@ -284,6 +284,7 @@ mod tests {
             lazy: false,
             vram_mb: None,
             pin: false,
+            gpus: vec![],
         }
     }
 

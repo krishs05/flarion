@@ -188,7 +188,13 @@ pub(super) struct GenerationResult {
 /// Abstraction over the llama-cpp-2 calls the worker makes; swapped for
 /// `ScriptedAdapter` in tests.
 pub(super) trait ModelAdapter: Send + 'static {
-    fn load(&mut self, config: &ModelConfig) -> Result<(), EngineError>;
+    fn load(
+        &mut self,
+        config: &ModelConfig,
+        main_gpu: u32,
+        devices: &[usize],
+        split_mode: llama_cpp_2::model::params::LlamaSplitMode,
+    ) -> Result<(), EngineError>;
 
     /// Generate tokens, invoking `on_event` for each sampled token. If the
     /// callback returns `ControlFlow::Break`, the run ends early with
@@ -213,18 +219,41 @@ pub(super) struct LlamaAdapter {
 }
 
 impl ModelAdapter for LlamaAdapter {
-    fn load(&mut self, config: &ModelConfig) -> Result<(), EngineError> {
+    fn load(
+        &mut self,
+        config: &ModelConfig,
+        main_gpu: u32,
+        devices: &[usize],
+        split_mode: llama_cpp_2::model::params::LlamaSplitMode,
+    ) -> Result<(), EngineError> {
         let path: &Path = config.path.as_ref().ok_or_else(|| {
             EngineError::ModelLoadFailed(format!("local backend '{}' has no path", config.id))
         })?;
 
-        info!(model_path = %path.display(), "loading model");
+        info!(
+            model_path = %path.display(),
+            main_gpu,
+            devices = ?devices,
+            split_mode = ?split_mode,
+            "loading model"
+        );
 
         let backend = LlamaCppBackend::init().map_err(|e| {
             EngineError::ModelLoadFailed(format!("failed to init llama backend: {e}"))
         })?;
 
-        let params = LlamaModelParams::default().with_n_gpu_layers(config.gpu_layers);
+        let mut params = LlamaModelParams::default()
+            .with_n_gpu_layers(config.gpu_layers)
+            .with_main_gpu(main_gpu as i32)
+            .with_split_mode(split_mode);
+        if !devices.is_empty() {
+            params = params.with_devices(devices).map_err(|e| {
+                EngineError::ModelLoadFailed(format!(
+                    "failed to set devices {devices:?}: {e}"
+                ))
+            })?;
+        }
+
         let model = LlamaModel::load_from_file(&backend, path, &params)
             .map_err(|e| EngineError::ModelLoadFailed(format!("failed to load model: {e}")))?;
 
@@ -391,7 +420,13 @@ pub(super) mod test_adapter {
     }
 
     impl ModelAdapter for ScriptedAdapter {
-        fn load(&mut self, _config: &ModelConfig) -> Result<(), EngineError> {
+        fn load(
+            &mut self,
+            _config: &ModelConfig,
+            _main_gpu: u32,
+            _devices: &[usize],
+            _split_mode: llama_cpp_2::model::params::LlamaSplitMode,
+        ) -> Result<(), EngineError> {
             let mut script = self.script.lock().unwrap();
             if let Some(ScriptStep::LoadFails(msg)) = script.first().cloned() {
                 script.remove(0);
@@ -505,19 +540,20 @@ mod scripted_adapter_tests {
             lazy: false,
             vram_mb: None,
             pin: false,
+            gpus: vec![],
         }
     }
 
     #[test]
     fn scripted_load_succeeds_by_default() {
         let mut a = ScriptedAdapter::new(vec![]);
-        assert!(a.load(&minimal_cfg()).is_ok());
+        assert!(a.load(&minimal_cfg(), 0, &[], llama_cpp_2::model::params::LlamaSplitMode::None).is_ok());
     }
 
     #[test]
     fn scripted_load_fails_when_step_requests() {
         let mut a = ScriptedAdapter::new(vec![ScriptStep::LoadFails("boom".into())]);
-        let err = a.load(&minimal_cfg()).unwrap_err();
+        let err = a.load(&minimal_cfg(), 0, &[], llama_cpp_2::model::params::LlamaSplitMode::None).unwrap_err();
         assert!(matches!(err, EngineError::ModelLoadFailed(ref m) if m == "boom"));
     }
 
@@ -529,7 +565,7 @@ mod scripted_adapter_tests {
             ScriptStep::Token("world".into()),
             ScriptStep::Eog,
         ]);
-        a.load(&minimal_cfg()).unwrap();
+        a.load(&minimal_cfg(), 0, &[], llama_cpp_2::model::params::LlamaSplitMode::None).unwrap();
         let mut events = Vec::new();
         let result = a
             .generate(&minimal_req(), &minimal_cfg(), &mut |e| {
@@ -553,7 +589,7 @@ mod scripted_adapter_tests {
             ScriptStep::Token("c".into()),
             ScriptStep::Eog,
         ]);
-        a.load(&minimal_cfg()).unwrap();
+        a.load(&minimal_cfg(), 0, &[], llama_cpp_2::model::params::LlamaSplitMode::None).unwrap();
         let mut count = 0;
         let result = a
             .generate(&minimal_req(), &minimal_cfg(), &mut |_| {
@@ -574,7 +610,7 @@ mod scripted_adapter_tests {
     #[should_panic(expected = "PanicOnSample")]
     fn scripted_generate_panics_on_script_step() {
         let mut a = ScriptedAdapter::new(vec![ScriptStep::PanicOnSample]);
-        a.load(&minimal_cfg()).unwrap();
+        a.load(&minimal_cfg(), 0, &[], llama_cpp_2::model::params::LlamaSplitMode::None).unwrap();
         let _ = a.generate(&minimal_req(), &minimal_cfg(), &mut |_| {
             ControlFlow::Continue(())
         });

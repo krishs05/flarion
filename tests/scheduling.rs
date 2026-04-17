@@ -38,6 +38,7 @@ fn local_model(id: &str, path: PathBuf, lazy: bool) -> ModelConfig {
         lazy,
         vram_mb: None,
         pin: false,
+        gpus: vec![],
     }
 }
 
@@ -115,15 +116,18 @@ fn overbudget_eager_config_fails_validation() {
     let mut cfg = FlarionConfig::default();
     cfg.server.host = "127.0.0.1".into();
     cfg.server.vram_budget_mb = VramBudgetSetting::Fixed(500);
-    cfg.models = vec![
-        local_model("a", path_a, false),
-        local_model("b", path_b, false),
-        local_model("c", path_c, false),
-    ];
-    // Each estimate ~240MB, total ~720MB > 500MB budget.
+    // Assign all models to gpu 0 so per-device check applies.
+    let mut a = local_model("a", path_a, false);
+    a.gpus = vec![0];
+    let mut b = local_model("b", path_b, false);
+    b.gpus = vec![0];
+    let mut c = local_model("c", path_c, false);
+    c.gpus = vec![0];
+    cfg.models = vec![a, b, c];
+    // Each estimate ~240MB, total ~720MB > 500MB budget on gpu 0.
     let err = cfg.validate().unwrap_err();
     assert!(
-        format!("{err}").contains("exceeds vram_budget_mb"),
+        format!("{err}").contains("exceeds budget="),
         "got: {err}"
     );
 }
@@ -198,6 +202,7 @@ fn overbudget_pinned_config_fails_validation() {
             lazy: true,
             vram_mb: None,
             pin: true,
+            gpus: vec![0],
         }
     }
 
@@ -210,7 +215,7 @@ fn overbudget_pinned_config_fails_validation() {
     ];
     let err = cfg.validate().unwrap_err();
     assert!(
-        format!("{err}").contains("pinned local models total"),
+        format!("{err}").contains("pinned local models on gpu"),
         "got {err}"
     );
 }
@@ -234,4 +239,110 @@ async fn evictor_trait_dispatches_to_backend_unload() {
     // Unknown model → ModelNotFound.
     let err = registry.unload("nope").await.unwrap_err();
     assert!(matches!(err, flarion::error::EngineError::ModelNotFound(_)));
+}
+
+#[test]
+fn integration_scheduler_best_fit_prefers_emptier_device() {
+    use flarion::engine::scheduling::{ReservationRequest, Scheduler};
+    use std::sync::atomic::{AtomicU32, AtomicU64};
+    use std::sync::Arc;
+
+    let sched = Scheduler::new(vec![10_000, 10_000]);
+    // Fill gpu 0 to 9000 MB. gpu 1 stays empty.
+    sched
+        .set(0)
+        .unwrap()
+        .try_reserve(ReservationRequest {
+            model_id: "filler",
+            cost_mb: 9000,
+            pinned: false,
+            last_used_ms: Arc::new(AtomicU64::new(0)),
+            in_flight: Arc::new(AtomicU32::new(0)),
+        })
+        .unwrap();
+    assert_eq!(sched.pick_most_free_device(), Some(1));
+}
+
+#[test]
+fn integration_scheduler_split_reservation_rolls_back_on_failure() {
+    use flarion::engine::scheduling::{
+        ReservationContext, ReservationRequest, Scheduler, SchedulerError,
+    };
+    use std::sync::atomic::{AtomicU32, AtomicU64};
+    use std::sync::Arc;
+
+    let sched = Scheduler::new(vec![10_000, 1_000]);
+    sched
+        .set(1)
+        .unwrap()
+        .try_reserve(ReservationRequest {
+            model_id: "filler",
+            cost_mb: 900,
+            pinned: false,
+            last_used_ms: Arc::new(AtomicU64::new(0)),
+            in_flight: Arc::new(AtomicU32::new(0)),
+        })
+        .unwrap();
+
+    let ctx = ReservationContext {
+        model_id: "big",
+        pinned: false,
+        last_used_ms: Arc::new(AtomicU64::new(0)),
+        in_flight: Arc::new(AtomicU32::new(0)),
+    };
+    let err = sched
+        .try_reserve_split(&[(0, 5000), (1, 500)], ctx)
+        .unwrap_err();
+    assert!(matches!(err, SchedulerError::OverBudget { gpu_id: 1, .. }));
+
+    // Rollback: gpu 0 back to 0.
+    assert_eq!(sched.set(0).unwrap().total_reserved_mb(), 0);
+    // Gpu 1 unchanged.
+    assert_eq!(sched.set(1).unwrap().total_reserved_mb(), 900);
+}
+
+#[test]
+fn integration_gpu_id_exceeds_declared_device_count_rejected() {
+    use flarion::config::{BackendType, FlarionConfig, ModelConfig, VramBudgetSetting};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = {
+        let p = dir.path().join("m.gguf");
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(100 * 1024 * 1024).unwrap();
+        drop(f);
+        p
+    };
+
+    // The override references a gpu_id beyond the declared device count,
+    // which resolve_vram_budgets (called inside validate) rejects with
+    // VramOverrideUnknownGpu.
+    let mut cfg = FlarionConfig::default();
+    cfg.server.host = "127.0.0.1".into();
+    cfg.server.vram_budget_mb = VramBudgetSetting::Fixed(1000);
+    cfg.server.vram_budget_overrides.insert(5, 500);
+    cfg.models = vec![ModelConfig {
+        id: "m".into(),
+        backend: BackendType::Local,
+        path: Some(path),
+        context_size: 4096,
+        gpu_layers: 99,
+        threads: None,
+        batch_size: None,
+        seed: None,
+        api_key: None,
+        base_url: None,
+        upstream_model: None,
+        timeout_secs: None,
+        max_tokens_cap: None,
+        lazy: false,
+        vram_mb: None,
+        pin: false,
+        gpus: vec![0],
+    }];
+    let err = cfg.validate().unwrap_err();
+    assert!(
+        format!("{err}").contains("vram_budget_overrides references gpu 5"),
+        "got {err}"
+    );
 }

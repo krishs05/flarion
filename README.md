@@ -298,6 +298,32 @@ lazy = true              # loaded on first request
   and the estimated footprint (`file size * 1.2`, or `vram_mb` override).
   Actual CUDA allocations might differ; set conservatively.
 
+## Migrating from 0.8.x
+
+v0.9.0 adds multi-GPU scheduling — explicit placement, tensor-parallel
+split, and best-fit auto-placement. All changes are additive; single-GPU
+configs run unchanged.
+
+To use:
+
+1. **Explicit placement.** Add `gpus = [0]` (or `[1]`, etc.) to any
+   `[[models]]` entry to pin it to a specific GPU.
+2. **Tensor-parallel split.** For models bigger than any single GPU's
+   VRAM, use `gpus = [0, 1, 2, ...]`. Flarion invokes llama-cpp-2 with
+   `with_devices(&[...]) + with_split_mode(LlamaSplitMode::Layer)`;
+   llama-cpp-2 distributes the model's layers across the listed devices
+   internally.
+3. **Mixed hardware.** Set `vram_budget_overrides = { 0 = N, 1 = M }`
+   in `[server]` to give specific GPUs different budgets.
+4. **Auto-placement.** Leave `gpus` unset (or `= []`) to let Flarion
+   pick the GPU with most free budget at first load. Decision is sticky
+   for the model's lifetime (reset when the model unloads).
+
+Metric label changes:
+- `flarion_vram_budget_mb{gpu}` — gained `gpu` label
+- `flarion_vram_reserved_mb{gpu, model}` — gained `gpu` label
+- `flarion_model_evictions_total{gpu, model, reason}` — gained `gpu` label
+
 ## Migrating from 0.7.x
 
 v0.8.0 adds LRU hot-swap, model pinning, and NVML-based auto VRAM detection.
