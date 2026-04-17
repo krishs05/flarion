@@ -134,8 +134,17 @@ impl LlamaBackend {
             "lazy load triggered"
         );
 
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        let last_used_ms = Arc::new(AtomicU64::new(0));
+        let in_flight = Arc::new(AtomicU32::new(0));
         self.resident_set
-            .try_reserve(&self.config.id, self.estimated_vram_mb)
+            .try_reserve(crate::engine::scheduling::ReservationRequest {
+                model_id: &self.config.id,
+                cost_mb: self.estimated_vram_mb,
+                pinned: self.config.pin,
+                last_used_ms,
+                in_flight,
+            })
             .map_err(|e| match e {
                 ResidentError::OverBudget {
                     model_id,
@@ -437,7 +446,16 @@ mod tests {
     async fn ensure_loaded_returns_over_budget_when_resident_set_full() {
         let cfg = test_config();
         let resident_set = crate::engine::scheduling::ResidentSet::new(1000);
-        resident_set.try_reserve("other", 1000).unwrap();
+        use std::sync::atomic::{AtomicU32, AtomicU64};
+        resident_set
+            .try_reserve(crate::engine::scheduling::ReservationRequest {
+                model_id: "other",
+                cost_mb: 1000,
+                pinned: false,
+                last_used_ms: std::sync::Arc::new(AtomicU64::new(0)),
+                in_flight: std::sync::Arc::new(AtomicU32::new(0)),
+            })
+            .unwrap();
         let backend = LlamaBackend::new(&cfg, resident_set, 500).unwrap();
         let err = backend.ensure_loaded().await.unwrap_err();
         assert!(matches!(err, EngineError::ModelUnavailable(_)));

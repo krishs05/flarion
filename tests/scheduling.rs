@@ -5,9 +5,11 @@
 //! real GGUF and is covered in the manual verification plan.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::Arc;
 
 use flarion::config::{BackendType, FlarionConfig, ModelConfig, VramBudgetSetting};
-use flarion::engine::scheduling::ResidentSet;
+use flarion::engine::scheduling::{ReservationRequest, ResidentSet};
 
 // Helper: build a sparse tempfile of `size_mb` MB.
 fn make_fake_gguf(dir: &std::path::Path, name: &str, size_mb: u64) -> PathBuf {
@@ -56,7 +58,15 @@ fn lazy_models_not_loaded_at_startup_via_resident_set() {
         if m.backend == BackendType::Local && !m.lazy {
             let path = m.path.as_ref().unwrap();
             let est = flarion::engine::scheduling::estimate_vram_mb(path, m.vram_mb).unwrap();
-            resident_set.try_reserve(&m.id, est).unwrap();
+            resident_set
+                .try_reserve(ReservationRequest {
+                    model_id: &m.id,
+                    cost_mb: est,
+                    pinned: false,
+                    last_used_ms: Arc::new(AtomicU64::new(0)),
+                    in_flight: Arc::new(AtomicU32::new(0)),
+                })
+                .unwrap();
         }
     }
     // Lazy model was skipped.
@@ -79,7 +89,15 @@ fn eager_model_reserves_budget_at_startup_via_resident_set() {
         if m.backend == BackendType::Local && !m.lazy {
             let path = m.path.as_ref().unwrap();
             let est = flarion::engine::scheduling::estimate_vram_mb(path, m.vram_mb).unwrap();
-            resident_set.try_reserve(&m.id, est).unwrap();
+            resident_set
+                .try_reserve(ReservationRequest {
+                    model_id: &m.id,
+                    cost_mb: est,
+                    pinned: false,
+                    last_used_ms: Arc::new(AtomicU64::new(0)),
+                    in_flight: Arc::new(AtomicU32::new(0)),
+                })
+                .unwrap();
         }
     }
     // 100MB file * 1.2 = 120MB reserved.
