@@ -118,6 +118,49 @@ impl ResidentSet {
         Ok(())
     }
 
+    /// Pick a list of currently-loaded model ids to evict in LRU order so
+    /// that releasing their combined `cost_mb` would free at least
+    /// `needed_mb`. Skips pinned models and models with `in_flight > 0`.
+    /// Returns `None` when no feasible combination of eligible candidates
+    /// can free enough.
+    pub fn pick_eviction_candidates(&self, needed_mb: u64) -> Option<Vec<String>> {
+        if self.budget_mb == 0 {
+            return None;
+        }
+        let inner = self.inner.lock().ok()?;
+
+        // Snapshot eligible entries.
+        use std::sync::atomic::Ordering;
+        let mut candidates: Vec<(String, u64, u64)> = inner
+            .loaded
+            .iter()
+            .filter_map(|(id, entry)| {
+                if entry.pinned {
+                    return None;
+                }
+                if entry.in_flight.load(Ordering::Acquire) > 0 {
+                    return None;
+                }
+                Some((id.clone(), entry.cost_mb, entry.last_used_ms.load(Ordering::Acquire)))
+            })
+            .collect();
+
+        // Sort ascending by last_used_ms (oldest first); stable tie-break.
+        candidates.sort_by_key(|(_, _, last_used)| *last_used);
+
+        // Accumulate until sum >= needed_mb.
+        let mut chosen = Vec::new();
+        let mut sum: u64 = 0;
+        for (id, cost, _) in candidates {
+            chosen.push(id);
+            sum = sum.saturating_add(cost);
+            if sum >= needed_mb {
+                return Some(chosen);
+            }
+        }
+        None
+    }
+
     /// Release the reservation for `model_id`. No-op if not reserved.
     pub fn release(&self, model_id: &str) {
         if self.budget_mb == 0 {
@@ -284,9 +327,6 @@ mod tests {
 
     #[test]
     fn reserve_request_carries_metadata() {
-        use std::sync::atomic::AtomicU32;
-        use std::sync::atomic::AtomicU64;
-
         let set = ResidentSet::new(4000);
         let last_used = Arc::new(AtomicU64::new(123));
         let in_flight = Arc::new(AtomicU32::new(0));
@@ -299,13 +339,13 @@ mod tests {
         })
         .unwrap();
         assert_eq!(set.total_reserved_mb(), 1000);
+        // Proves pinned flag was actually stored: pick_eviction_candidates
+        // must skip the only reserved entry.
+        assert!(set.pick_eviction_candidates(500).is_none());
     }
 
     #[test]
     fn reserve_request_idempotent_for_same_id() {
-        use std::sync::atomic::AtomicU32;
-        use std::sync::atomic::AtomicU64;
-
         let set = ResidentSet::new(4000);
         let last_used = Arc::new(AtomicU64::new(0));
         let in_flight = Arc::new(AtomicU32::new(0));
@@ -320,5 +360,102 @@ mod tests {
             .unwrap();
         }
         assert_eq!(set.total_reserved_mb(), 1000);
+    }
+
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AOrd};
+
+    fn mk_entry_req<'a>(
+        model_id: &'a str,
+        cost_mb: u64,
+        pinned: bool,
+        last_used_ms: u64,
+        in_flight_val: u32,
+    ) -> ReservationRequest<'a> {
+        ReservationRequest {
+            model_id,
+            cost_mb,
+            pinned,
+            last_used_ms: Arc::new(AtomicU64::new(last_used_ms)),
+            in_flight: Arc::new(AtomicU32::new(in_flight_val)),
+        }
+    }
+
+    #[test]
+    fn pick_eviction_candidates_returns_lru_first() {
+        let set = ResidentSet::new(10_000);
+        set.try_reserve(mk_entry_req("a", 3000, false, 300, 0)).unwrap();
+        set.try_reserve(mk_entry_req("b", 3000, false, 100, 0)).unwrap();
+        set.try_reserve(mk_entry_req("c", 3000, false, 200, 0)).unwrap();
+        let victims = set.pick_eviction_candidates(3000).unwrap();
+        assert_eq!(victims, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn pick_eviction_candidates_skips_pinned() {
+        let set = ResidentSet::new(10_000);
+        set.try_reserve(mk_entry_req("pinned_old", 3000, true, 100, 0)).unwrap();
+        set.try_reserve(mk_entry_req("unpinned_new", 3000, false, 500, 0)).unwrap();
+        let victims = set.pick_eviction_candidates(3000).unwrap();
+        assert_eq!(victims, vec!["unpinned_new".to_string()]);
+    }
+
+    #[test]
+    fn pick_eviction_candidates_skips_busy() {
+        let set = ResidentSet::new(10_000);
+        set.try_reserve(mk_entry_req("busy_old", 3000, false, 100, 1)).unwrap();
+        set.try_reserve(mk_entry_req("idle_new", 3000, false, 500, 0)).unwrap();
+        let victims = set.pick_eviction_candidates(3000).unwrap();
+        assert_eq!(victims, vec!["idle_new".to_string()]);
+    }
+
+    #[test]
+    fn pick_eviction_candidates_returns_none_when_insufficient() {
+        let set = ResidentSet::new(10_000);
+        set.try_reserve(mk_entry_req("pinned", 3000, true, 100, 0)).unwrap();
+        set.try_reserve(mk_entry_req("busy", 3000, false, 200, 1)).unwrap();
+        assert!(set.pick_eviction_candidates(3000).is_none());
+    }
+
+    #[test]
+    fn pick_eviction_candidates_accumulates_multiple_victims() {
+        let set = ResidentSet::new(10_000);
+        set.try_reserve(mk_entry_req("a", 2000, false, 100, 0)).unwrap();
+        set.try_reserve(mk_entry_req("b", 2000, false, 200, 0)).unwrap();
+        set.try_reserve(mk_entry_req("c", 2000, false, 300, 0)).unwrap();
+        // Need 3500 → evict a+b (oldest two), sum=4000.
+        let victims = set.pick_eviction_candidates(3500).unwrap();
+        assert_eq!(victims.len(), 2);
+        assert!(victims.contains(&"a".to_string()));
+        assert!(victims.contains(&"b".to_string()));
+        assert!(!victims.contains(&"c".to_string()));
+    }
+
+    #[test]
+    fn pick_eviction_candidates_reads_in_flight_live() {
+        // Verifies in_flight is checked at call time, not at reserve time.
+        let set = ResidentSet::new(10_000);
+        let in_flight_a = Arc::new(AtomicU32::new(0));
+        let in_flight_b = Arc::new(AtomicU32::new(0));
+        set.try_reserve(ReservationRequest {
+            model_id: "a",
+            cost_mb: 3000,
+            pinned: false,
+            last_used_ms: Arc::new(AtomicU64::new(100)),
+            in_flight: in_flight_a.clone(),
+        })
+        .unwrap();
+        set.try_reserve(ReservationRequest {
+            model_id: "b",
+            cost_mb: 3000,
+            pinned: false,
+            last_used_ms: Arc::new(AtomicU64::new(500)),
+            in_flight: in_flight_b.clone(),
+        })
+        .unwrap();
+
+        // 'a' is LRU but becomes busy after reservation — should be skipped.
+        in_flight_a.store(1, AOrd::Release);
+        let victims = set.pick_eviction_candidates(3000).unwrap();
+        assert_eq!(victims, vec!["b".to_string()]);
     }
 }
