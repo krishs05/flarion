@@ -2,14 +2,138 @@
 host = "0.0.0.0"
 port = 8080
 
-[model]
+# Optional: when set, all /v1/* requests must include `Authorization: Bearer <key>`.
+# /health is always public. Use ${ENV_VAR} interpolation to keep secrets out of the file.
+# api_keys = ["${FLARION_KEY_DEV}", "${FLARION_KEY_TEAM}"]
+
+# Graceful shutdown budget in seconds. In-flight inferences get this long
+# to finish after SIGTERM/Ctrl+C before worker threads are abandoned and
+# the process exits. Default 30. Set to 0 for immediate abort on shutdown.
+# Valid range [0, 3600]. Added in v0.6.0 (Phase 2e).
+# shutdown_grace_secs = 30
+
+# Phase 2f: VRAM budget for local model scheduling (MB). Loads beyond
+# this are refused with 503 model_unavailable. Default 0 = disabled.
+# Set to your GPU's usable VRAM minus headroom (e.g. 22000 for a 24GB
+# card with 2GB reserved for CUDA overhead).
+# vram_budget_mb = 22000
+
+# Local llama.cpp model
+[[models]]
 id = "my-model"
+backend = "local"
 path = "/path/to/your/model.gguf"
 context_size = 4096
 gpu_layers = 99
 # threads = 8
 # batch_size = 512
 # seed = 42
+# Phase 2f: lazy = true defers model load until first request.
+# lazy = true
+# Phase 2f: override the auto-estimated VRAM footprint (MB).
+# Default: file size * 1.2.
+# vram_mb = 6000
+
+# Example: OpenAI cloud backend
+# [[models]]
+# id = "gpt-4o"
+# backend = "openai"
+# api_key = "${OPENAI_API_KEY}"
+# upstream_model = "gpt-4o"               # optional; defaults to local id
+# base_url = "https://api.openai.com/v1"  # optional; uses provider default
+# timeout_secs = 300                      # optional
+
+# Example: Groq cloud backend (OpenAI-compatible, different default base_url)
+# [[models]]
+# id = "groq-llama-3.3-70b"
+# backend = "groq"
+# api_key = "${GROQ_API_KEY}"
+# upstream_model = "llama-3.3-70b-versatile"
+
+# Example: Anthropic cloud backend
+# [[models]]
+# id = "claude-sonnet"
+# backend = "anthropic"
+# api_key = "${ANTHROPIC_API_KEY}"
+# upstream_model = "claude-sonnet-4-5-20250929"
 
 [logging]
 level = "info"
+
+# ── Smart Routing (Phase 2c) ──────────────────────────────────────────────
+#
+# Routes let you address a single client-facing model id that resolves to one
+# of several real backends based on request shape, with ordered fallback on
+# failure. Route ids share the same namespace as model ids — clients send
+# `model: "chat"` and the router picks the backend.
+#
+# [[routes]]
+# id = "chat"                                # client sends model: "chat"
+# first_token_timeout_ms = 5000              # default for all rules in this route
+#
+#   [[routes.rules]]
+#   # Long prompts go to the long-context model.
+#   name = "long-prompt"
+#   matchers = { prompt_tokens_gte = 4000 }
+#   targets = ["cloud-long"]
+#
+#   [[routes.rules]]
+#   # Streaming requests: try local first, fall back to cloud.
+#   name = "streaming-default"
+#   matchers = { stream = true }
+#   targets = ["local-qwen", "cloud-small"]
+#   first_token_timeout_ms = 3000            # overrides route default
+#
+#   [[routes.rules]]
+#   # Catch-all — required for every route.
+#   name = "fallback"
+#   matchers = {}
+#   targets = ["cloud-small"]
+#
+# Matcher keys (all optional, AND-combined):
+#   stream              = true | false
+#   prompt_tokens_gte   = u32          (approximate: chars / 4)
+#   prompt_tokens_lte   = u32
+#   message_count_gte   = u32
+#   message_count_lte   = u32
+#   has_system_prompt   = true | false
+#   content_regex       = "..."        (matched against last user message)
+#   header_equals       = { "X-Name" = "value" }
+
+# ── Metrics (Phase 2c) ────────────────────────────────────────────────────
+#
+# Prometheus exporter. Off by default. When enabled, exposes counters +
+# histograms at the configured path. Scrape with Prometheus or any compatible
+# collector.
+#
+# [metrics]
+# enabled = true
+# path = "/metrics"
+
+# ── Phase 2d security knobs ───────────────────────────────────────────────
+#
+# [server] extra fields:
+#   allow_unauthenticated = false    # Opt-in for public binds without api_keys.
+#                                    # Default false refuses such setups at
+#                                    # startup. Keep as false unless an upstream
+#                                    # proxy handles auth.
+#
+#   cors_origins = []                # Explicit allow-list of browser origins.
+#                                    # Empty + loopback bind = permissive for dev.
+#                                    # Empty + public bind = deny all cross-origin.
+#                                    # Non-empty = that list verbatim.
+#
+#   allow_plaintext_upstream = false # Opt-in for http://, loopback, and
+#                                    # private-range base_urls on cloud backends.
+#                                    # Default false prevents SSRF via env-var
+#                                    # manipulation.
+#
+# [[models]] extra field:
+#   max_tokens_cap = 16384           # Override the global 8192 ceiling.
+#                                    # Requests above this are silently clamped.
+#
+# [metrics] extra field:
+#   bind = "127.0.0.1:9091"          # Optional dedicated listener. When set,
+#                                    # /metrics moves off the main listener and
+#                                    # runs without auth — bind to a trusted
+#                                    # interface (loopback).

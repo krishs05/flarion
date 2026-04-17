@@ -1,0 +1,59 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@theme {
+  --color-ember: #FF6B2B;
+  --color-midnight: #0F1419;
+  --color-carbon: #1A1F26;
+  --color-cyan-flare: #00D4FF;
+  --color-frost: #E8ECF1;
+  --color-graphite: #6B7A8D;
+  --color-signal: #FF3B4F;
+  --color-wire: #2A3441;
+
+  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+}
+
+html, body {
+  background-color: var(--color-midnight);
+  color: var(--color-frost);
+  font-family: var(--font-sans);
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-wire);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-graphite);
+}
+
+/* highlight.js atom-one-dark override for Flarion palette */
+.hljs {
+  background: var(--color-carbon) !important;
+  color: var(--color-frost) !important;
+  padding: 1rem;
+  border-radius: 0.375rem;
+  border: 1px solid var(--color-wire);
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+}
+.hljs-keyword, .hljs-built_in { color: var(--color-ember); }
+.hljs-string, .hljs-attr { color: #b5e890; }
+.hljs-number, .hljs-literal { color: var(--color-cyan-flare); }
+.hljs-comment { color: var(--color-graphite); font-style: italic; }
+.hljs-function, .hljs-title { color: var(--color-cyan-flare); }

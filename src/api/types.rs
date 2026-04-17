@@ -1,7 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-// ── Request Types ──
-
 #[derive(Debug, Deserialize, Clone)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -35,9 +33,7 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-// ── Non-Streaming Response ──
-
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatCompletionResponse {
     pub id: String,
     pub object: String,
@@ -47,23 +43,21 @@ pub struct ChatCompletionResponse {
     pub usage: Usage,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatCompletionChoice {
     pub index: u32,
     pub message: ChatMessage,
     pub finish_reason: String,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
 }
 
-// ── Streaming Response ──
-
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatCompletionChunk {
     pub id: String,
     pub object: String,
@@ -72,22 +66,20 @@ pub struct ChatCompletionChunk {
     pub choices: Vec<ChatCompletionChunkChoice>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatCompletionChunkChoice {
     pub index: u32,
     pub delta: ChatDelta,
     pub finish_reason: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChatDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
 }
-
-// ── Models Endpoint ──
 
 #[derive(Debug, Serialize)]
 pub struct ModelsResponse {
@@ -103,15 +95,9 @@ pub struct ModelObject {
     pub owned_by: String,
 }
 
-// ── Health Endpoint ──
-
-#[derive(Debug, Serialize)]
-pub struct HealthResponse {
-    pub status: String,
-    pub version: String,
-    pub model_loaded: bool,
-    pub model_id: String,
-}
+// /health intentionally emits an ad-hoc JSON literal (see `src/api/health.rs`);
+// the previous typed responses leaked version + per-model load state to
+// unauthenticated callers.
 
 #[cfg(test)]
 mod tests {
@@ -205,4 +191,5 @@ mod tests {
         assert_eq!(json["object"], "list");
         assert_eq!(json["data"][0]["owned_by"], "local");
     }
+
 }

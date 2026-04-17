@@ -1,7 +1,8 @@
 # Rust
 /target
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is committed — Flarion is a binary crate, so pinning transitive
+# deps improves reproducibility and makes `cargo audit` results meaningful.
 
 # Model files
 *.gguf
@@ -22,3 +23,17 @@ Thumbs.db
 
 # Environment
 .env
+
+# Local developer configs (contain host-specific paths)
+/my-config.toml
+
+# Frontend build artifacts
+/ui/node_modules
+/ui/build
+/ui/.svelte-kit
+/ui/dist
+
+# Internal planning docs (kept local, not published)
+/docs/superpowers/
+/.planning/
+/.claude/
