@@ -570,6 +570,37 @@ impl FlarionConfig {
             }
         }
 
+        // Pinned local models — both eager and lazy — must all fit. Once
+        // loaded, pinned models can never be evicted.
+        if self.server.vram_budget_mb > 0 {
+            let mut total_mb: u64 = 0;
+            let mut offenders: Vec<(String, u64)> = Vec::new();
+            for m in &self.models {
+                if m.backend != BackendType::Local || !m.pin {
+                    continue;
+                }
+                let path = m
+                    .path
+                    .as_ref()
+                    .expect("local backend path must be set — earlier validation ensures this");
+                let est = crate::engine::scheduling::estimate_vram_mb(path, m.vram_mb)
+                    .map_err(|e| match e {
+                        crate::engine::scheduling::EstimateError::StatFailed { path, source } => {
+                            ConfigError::VramEstimateFailed { id: m.id.clone(), path, source }
+                        }
+                    })?;
+                total_mb = total_mb.saturating_add(est);
+                offenders.push((m.id.clone(), est));
+            }
+            if total_mb > self.server.vram_budget_mb {
+                return Err(ConfigError::PinnedExceedsBudget {
+                    total_mb,
+                    budget_mb: self.server.vram_budget_mb,
+                    offenders,
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -764,6 +795,15 @@ pub enum ConfigError {
         "model '{id}' has pin=true but backend={backend:?}; pin is only supported for local backends"
     )]
     PinOnlyForLocal { id: String, backend: BackendType },
+
+    #[error(
+        "pinned local models total {total_mb}MB, exceeds vram_budget_mb={budget_mb}; offenders: {offenders:?}"
+    )]
+    PinnedExceedsBudget {
+        total_mb: u64,
+        budget_mb: u64,
+        offenders: Vec<(String, u64)>,
+    },
 }
 
 #[cfg(test)]
@@ -2250,5 +2290,87 @@ vram_mb = 6000
             matches!(err, ConfigError::PinOnlyForLocal { .. }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn test_validate_rejects_pinned_over_budget() {
+        // Each file is 200 MB → estimate ~240 MB. Three pinned models = ~720 MB.
+        let (_a_dir, a_path) = make_fake_gguf(200);
+        let (_b_dir, b_path) = make_fake_gguf(200);
+        let (_c_dir, c_path) = make_fake_gguf(200);
+
+        let mut cfg = FlarionConfig::default();
+        cfg.server.host = "127.0.0.1".into();
+        cfg.server.vram_budget_mb = 500;
+        cfg.models = vec![
+            ModelConfig {
+                id: "a".into(),
+                backend: BackendType::Local,
+                path: Some(a_path),
+                context_size: 4096,
+                gpu_layers: 99,
+                threads: None,
+                batch_size: None,
+                seed: None,
+                api_key: None,
+                base_url: None,
+                upstream_model: None,
+                timeout_secs: None,
+                max_tokens_cap: None,
+                lazy: true,
+                vram_mb: None,
+                pin: true,
+            },
+            ModelConfig {
+                id: "b".into(),
+                backend: BackendType::Local,
+                path: Some(b_path),
+                context_size: 4096,
+                gpu_layers: 99,
+                threads: None,
+                batch_size: None,
+                seed: None,
+                api_key: None,
+                base_url: None,
+                upstream_model: None,
+                timeout_secs: None,
+                max_tokens_cap: None,
+                lazy: true,
+                vram_mb: None,
+                pin: true,
+            },
+            ModelConfig {
+                id: "c".into(),
+                backend: BackendType::Local,
+                path: Some(c_path),
+                context_size: 4096,
+                gpu_layers: 99,
+                threads: None,
+                batch_size: None,
+                seed: None,
+                api_key: None,
+                base_url: None,
+                upstream_model: None,
+                timeout_secs: None,
+                max_tokens_cap: None,
+                lazy: true,
+                vram_mb: None,
+                pin: true,
+            },
+        ];
+
+        let err = cfg.validate().unwrap_err();
+        match err {
+            ConfigError::PinnedExceedsBudget { total_mb, budget_mb, offenders } => {
+                assert!(total_mb > budget_mb, "total={total_mb} budget={budget_mb}");
+                assert_eq!(budget_mb, 500);
+                assert_eq!(offenders.len(), 3);
+                let ids: Vec<&str> = offenders.iter().map(|(id, _)| id.as_str()).collect();
+                assert!(ids.contains(&"a"));
+                assert!(ids.contains(&"b"));
+                assert!(ids.contains(&"c"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 }
