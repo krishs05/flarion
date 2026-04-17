@@ -403,6 +403,69 @@ impl InferenceBackend for LlamaBackend {
         self.config.max_tokens_cap.unwrap_or(8192)
     }
 
+    async fn unload(&self) -> Result<(), EngineError> {
+        // Atomic busy-check: in_flight is bumped under this same lock by
+        // ensure_loaded_for_request's fast path, so seeing 0 here means no
+        // request can acquire a guard until we release and transition.
+        let mut guard = self.load_state.lock().await;
+        if self.in_flight.load(Ordering::Acquire) > 0 {
+            return Err(EngineError::BackendBusy);
+        }
+
+        // Snapshot current state and decide.
+        let loaded = match &mut *guard {
+            LoadState::Loaded(_) => {
+                // Take ownership by replacing with Unloaded.
+                if let LoadState::Loaded(l) = std::mem::replace(&mut *guard, LoadState::Unloaded) {
+                    l
+                } else {
+                    unreachable!()
+                }
+            }
+            LoadState::Unloaded => return Ok(()),
+            LoadState::Loading(_) => {
+                // Loading sentinel should have kept in_flight > 0; if we
+                // reach here the invariant is broken. Defensive BackendBusy.
+                return Err(EngineError::BackendBusy);
+            }
+        };
+        drop(guard);
+
+        // Send shutdown, await ack (bounded), then join worker thread.
+        let (ack_tx, ack_rx) = oneshot::channel();
+        let send_ok = loaded
+            .cmd_tx
+            .send(WorkerCommand::Shutdown { ack: ack_tx })
+            .await
+            .is_ok();
+        drop(loaded.cmd_tx);
+
+        if send_ok {
+            let _ = tokio::time::timeout(Duration::from_secs(30), ack_rx).await;
+        }
+
+        if let Some(handle) = loaded.worker_handle {
+            let join_res = tokio::task::spawn_blocking(move || handle.join()).await;
+            if join_res.is_err() {
+                tracing::warn!(
+                    model_id = %self.config.id,
+                    "worker thread panicked during unload"
+                );
+            }
+        }
+
+        self.resident_set.release(&self.config.id);
+        crate::metrics::set_vram_reserved(&self.config.id, 0);
+        metrics::counter!(
+            "flarion_model_unloads_total",
+            "model" => self.config.id.clone(),
+            "result" => "success",
+        )
+        .increment(1);
+        tracing::info!(model_id = %self.config.id, "model unloaded");
+        Ok(())
+    }
+
     async fn shutdown(&self, grace: Duration) {
         self.draining.store(true, Ordering::Release);
         let loaded = {
@@ -725,5 +788,45 @@ mod tests {
         let _g = backend.ensure_loaded_for_request().await.unwrap();
         let after = backend.last_used_ms.load(Ordering::Acquire);
         assert!(after > before);
+    }
+
+    #[tokio::test]
+    async fn unload_when_unloaded_is_noop() {
+        let backend = LlamaBackend::new(
+            &test_config(),
+            crate::engine::scheduling::ResidentSet::new(0),
+            0,
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+        .unwrap();
+        backend.unload().await.unwrap();
+        let state = backend.load_state.lock().await;
+        assert!(matches!(&*state, LoadState::Unloaded));
+    }
+
+    #[tokio::test]
+    async fn unload_when_busy_returns_backend_busy() {
+        let backend = LlamaBackend::new(
+            &test_config(),
+            crate::engine::scheduling::ResidentSet::new(0),
+            0,
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+        .unwrap();
+        // Fake Loaded + in_flight=1.
+        {
+            let (dummy_tx, _rx) = tokio::sync::mpsc::channel(1);
+            let mut guard = backend.load_state.lock().await;
+            *guard = LoadState::Loaded(LoadedState {
+                cmd_tx: dummy_tx,
+                worker_handle: None,
+            });
+        }
+        backend.in_flight.store(1, Ordering::Release);
+        let err = backend.unload().await.unwrap_err();
+        assert!(matches!(err, EngineError::BackendBusy), "got {err:?}");
+        // State should still be Loaded.
+        let state = backend.load_state.lock().await;
+        assert!(matches!(&*state, LoadState::Loaded(_)));
     }
 }

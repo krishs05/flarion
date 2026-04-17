@@ -61,6 +61,14 @@ pub fn install() -> Result<Arc<PrometheusHandle>, String> {
         "flarion_model_loads_total",
         "Model load attempts, labeled by outcome (success|over_budget|load_failed)"
     );
+    metrics::describe_counter!(
+        "flarion_model_unloads_total",
+        "Model unload attempts, labeled by outcome (success|failed)"
+    );
+    metrics::describe_counter!(
+        "flarion_model_evictions_total",
+        "Model evictions triggered to free VRAM, labeled by reason (lru)"
+    );
 
     metrics::gauge!(BUILD_INFO, "version" => env!("CARGO_PKG_VERSION").to_string()).set(1.0);
 
