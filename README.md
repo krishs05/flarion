@@ -1,9 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/flarion-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="assets/flarion-light.svg">
-    <img src="assets/flarion-light.svg" alt="Flarion" width="180" />
-  </picture>
+  <img src="assets/flarion-mark.svg" alt="Flarion" width="180" />
 </p>
 
 <h1 align="center">Flarion</h1>
