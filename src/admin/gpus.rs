@@ -33,3 +33,10 @@ pub fn gpu_snapshot(_state: &Arc<AdminState>) -> Vec<Gpu> {
     }
     Vec::new()
 }
+
+use axum::Json;
+use axum::extract::State;
+
+pub async fn get_gpus(State(state): State<Arc<AdminState>>) -> Json<Vec<Gpu>> {
+    Json(gpu_snapshot(&state))
+}

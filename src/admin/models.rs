@@ -26,3 +26,10 @@ pub fn model_snapshot(state: &Arc<AdminState>) -> Vec<Model> {
         }
     }).collect()
 }
+
+use axum::Json;
+use axum::extract::State;
+
+pub async fn get_models(State(state): State<Arc<AdminState>>) -> Json<Vec<Model>> {
+    Json(model_snapshot(&state))
+}

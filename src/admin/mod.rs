@@ -17,5 +17,7 @@ pub fn admin_router(state: Arc<AdminState>) -> Router {
     Router::new()
         .route("/v1/admin/version", get(version::get_version))
         .route("/v1/admin/status", get(status::get_status))
+        .route("/v1/admin/gpus", get(gpus::get_gpus))
+        .route("/v1/admin/models", get(models::get_models))
         .with_state(state)
 }
