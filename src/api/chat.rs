@@ -45,6 +45,74 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// RAII guard for the streaming path. Moved into `done_stream` so it is
+/// consumed (and disarmed) when the terminal SSE future resolves. If the
+/// client disconnects before `done_stream` runs, the future is dropped,
+/// taking the guard with it; Drop decrements the counter without emitting
+/// an event (can't `.await` from Drop).
+struct InFlightStreamGuard {
+    admin: Option<Arc<crate::admin::state::AdminState>>,
+    model_id: String,
+    req_id: String,
+    started: std::time::Instant,
+    backend_id: String,
+    armed: bool,
+}
+
+impl InFlightStreamGuard {
+    /// Called from `done_stream` on clean terminus — disarms, decrements the
+    /// counter, emits the admin event classified by `status`.
+    /// `status` is one of: "success" | "canceled" | "server_error".
+    async fn finalize(mut self, status: &str, err_reason: Option<String>) {
+        self.armed = false;
+        let Some(admin) = self.admin.clone() else { return };
+        admin.tracker.in_flight_dec(&self.model_id);
+        let duration_ms = self.started.elapsed().as_millis() as u64;
+        let event = match status {
+            "success" => crate::admin::types::RequestEvent::Completed {
+                id: self.req_id.clone(),
+                ts: chrono::Utc::now().to_rfc3339(),
+                route: None,
+                matched_rule: None,
+                backend: self.backend_id.clone(),
+                fallback_count: 0,
+                status: "ok".into(),
+                ttft_ms: None,
+                duration_ms,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+            },
+            "canceled" => crate::admin::types::RequestEvent::Canceled {
+                id: self.req_id.clone(),
+                ts: chrono::Utc::now().to_rfc3339(),
+                backend: self.backend_id.clone(),
+                duration_ms,
+            },
+            _ => crate::admin::types::RequestEvent::Failed {
+                id: self.req_id.clone(),
+                ts: chrono::Utc::now().to_rfc3339(),
+                backend: self.backend_id.clone(),
+                reason: err_reason.unwrap_or_else(|| status.to_string()),
+                duration_ms,
+            },
+        };
+        admin.tracker.record(event).await;
+    }
+}
+
+/// If the SSE stream is dropped mid-flight (client disconnect), `done_stream`
+/// is dropped without running, so `finalize` never fires. Drop here balances
+/// the counter. No event is emitted because Drop can't `.await`.
+impl Drop for InFlightStreamGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(admin) = &self.admin {
+                admin.tracker.in_flight_dec(&self.model_id);
+            }
+        }
+    }
+}
+
 pub async fn chat_completions(
     State(state): State<crate::server::ApiState>,
     headers: HeaderMap,
@@ -93,9 +161,23 @@ pub async fn chat_completions(
         if let Some(admin) = admin.as_ref() {
             admin.tracker.in_flight_inc(&model_id);
         }
-        // TODO(Task 3b): emit Started here and Completed/Failed/Canceled inside
-        //   done_stream, with matching in_flight_dec. Reuse the existing
-        //   `saw_finish` atomic and `err_rx` oneshot to classify status.
+        if let Some(admin) = admin.as_ref() {
+            admin.tracker.record(crate::admin::types::RequestEvent::Started {
+                id: req_id.clone(),
+                ts: chrono::Utc::now().to_rfc3339(),
+                route: None,
+                backend: model_id.clone(),
+            }).await;
+        }
+
+        let guard = InFlightStreamGuard {
+            admin: admin.clone(),
+            model_id: model_id.clone(),
+            req_id: req_id.clone(),
+            started: start,
+            backend_id: model_id.clone(),
+            armed: true,
+        };
 
         let (tx, rx) = tokio::sync::mpsc::channel::<ChatCompletionChunk>(256);
         let backend_clone = backend.clone();
@@ -164,6 +246,9 @@ pub async fn chat_completions(
                 "status" => status,
             )
             .increment(1);
+
+            // Admin lifecycle event — disarms guard, decrements counter, records event.
+            guard.finalize(status, err.clone()).await;
 
             let data = match err {
                 Some(msg) => {
@@ -397,5 +482,43 @@ mod admin_emission_tests {
             Json(mk_request("m", false)),
         ).await.unwrap();
         // No panic, handler returns Ok — assertion is behavioral absence of effects.
+    }
+
+    #[tokio::test]
+    async fn streaming_emits_started_and_completed_on_clean_finish() {
+        use http_body_util::BodyExt;
+
+        let mut reg = BackendRegistry::new();
+        reg.insert("m".into(), Arc::new(MockBackend::streaming_chunks(
+            "m",
+            vec!["hel".into(), "lo".into()],
+        )));
+        let registry = Arc::new(reg);
+        let admin = Arc::new(AdminState::new(registry.clone(), "127.0.0.1:0".into(), 100));
+
+        let state = crate::server::ApiState {
+            registry: registry.clone(),
+            admin: Some(admin.clone()),
+        };
+        let resp = chat_completions(
+            State(state),
+            HeaderMap::new(),
+            Json(mk_request("m", true)),
+        ).await.unwrap();
+
+        // Drain the SSE body so done_stream runs to completion.
+        let mut body = resp.into_body();
+        while let Some(frame) = body.frame().await {
+            let _ = frame;
+        }
+
+        // finalize runs inside done_stream, which the drain above awaited.
+        let events = admin.tracker.tail(10).await;
+        assert!(events.len() >= 2, "expected at least Started + Completed, got: {events:?}");
+        assert!(matches!(events.first(), Some(crate::admin::types::RequestEvent::Started { .. })),
+            "first event: {:?}", events.first());
+        assert!(matches!(events.last(), Some(crate::admin::types::RequestEvent::Completed { .. })),
+            "last event: {:?}", events.last());
+        assert_eq!(admin.tracker.in_flight("m"), 0, "counter must be balanced");
     }
 }
