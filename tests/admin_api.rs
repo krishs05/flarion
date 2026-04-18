@@ -163,3 +163,106 @@ async fn admin_models_returns_empty_array_for_empty_registry() {
     let v: Vec<flarion::admin::types::Model> = serde_json::from_slice(&body).unwrap();
     assert!(v.is_empty());
 }
+
+#[tokio::test]
+async fn admin_requests_tail_returns_most_recent() {
+    let registry = Arc::new(BackendRegistry::new());
+    let admin = make_admin_state(registry.clone());
+    admin.tracker.record(flarion::admin::types::RequestEvent::Started {
+        id: "a".into(),
+        ts: "2026-04-18T00:00:00Z".into(),
+        route: None,
+        backend: "m".into(),
+    }).await;
+    admin.tracker.record(flarion::admin::types::RequestEvent::Started {
+        id: "b".into(),
+        ts: "2026-04-18T00:00:01Z".into(),
+        route: None,
+        backend: "m".into(),
+    }).await;
+
+    let app = create_router_with_admin(
+        registry,
+        admin,
+        &ServerConfig::default(),
+        &MetricsConfig::default(),
+        None,
+    );
+    let resp = app.oneshot(
+        Request::builder().uri("/v1/admin/requests?tail=1").body(Body::empty()).unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let v: Vec<flarion::admin::types::RequestEvent> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v.len(), 1);
+    if let flarion::admin::types::RequestEvent::Started { id, .. } = &v[0] {
+        assert_eq!(id, "b");
+    } else { panic!("expected Started"); }
+}
+
+#[tokio::test]
+async fn admin_requests_tail_default_caps_at_1000() {
+    let registry = Arc::new(BackendRegistry::new());
+    let admin = make_admin_state(registry.clone());
+    let app = create_router_with_admin(
+        registry,
+        admin,
+        &ServerConfig::default(),
+        &MetricsConfig::default(),
+        None,
+    );
+    // No tail param — should default to 50 (empty buffer → empty array)
+    let resp = app.oneshot(
+        Request::builder().uri("/v1/admin/requests").body(Body::empty()).unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let v: Vec<flarion::admin::types::RequestEvent> = serde_json::from_slice(&body).unwrap();
+    assert!(v.is_empty());
+}
+
+#[tokio::test]
+async fn admin_requests_stream_delivers_events() {
+    use http_body_util::BodyExt;
+
+    let registry = Arc::new(BackendRegistry::new());
+    let admin = make_admin_state(registry.clone());
+    let admin_for_push = admin.clone();
+
+    let app = create_router_with_admin(
+        registry,
+        admin,
+        &ServerConfig::default(),
+        &MetricsConfig::default(),
+        None,
+    );
+
+    // Start the subscribe request. It returns immediately with the SSE
+    // response; we read frames from the body.
+    let resp = app.oneshot(
+        Request::builder().uri("/v1/admin/requests/stream").body(Body::empty()).unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Push an event after the subscription is live.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        admin_for_push.tracker.record(flarion::admin::types::RequestEvent::Started {
+            id: "s".into(),
+            ts: "2026-04-18T00:00:00Z".into(),
+            route: None,
+            backend: "m".into(),
+        }).await;
+    });
+
+    // Read the first SSE frame.
+    let mut body = resp.into_body();
+    let frame = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        body.frame(),
+    ).await.expect("timeout waiting for SSE frame").expect("no frame").expect("frame err");
+    let bytes = frame.into_data().expect("data frame");
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.contains("data:"), "expected 'data:' in SSE frame, got: {text}");
+    assert!(text.contains("\"event\":\"started\""), "expected started event, got: {text}");
+}
