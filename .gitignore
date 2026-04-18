@@ -40,3 +40,6 @@ Thumbs.db
 
 # Git worktrees (local-only isolated workspaces)
 /.worktrees/
+
+# Local AI-assistant guidance (kept out of the public repo)
+/CLAUDE.md
