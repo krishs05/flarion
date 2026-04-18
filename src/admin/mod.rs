@@ -1,3 +1,4 @@
+pub mod config;
 pub mod gpus;
 pub mod models;
 pub mod requests;
@@ -23,5 +24,6 @@ pub fn admin_router(state: Arc<AdminState>) -> Router {
         .route("/v1/admin/requests", get(requests::get_requests))
         .route("/v1/admin/requests/stream", get(requests::stream_requests))
         .route("/v1/admin/routes", get(routes::get_routes))
+        .route("/v1/admin/config", get(config::get_config))
         .with_state(state)
 }

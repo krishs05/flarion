@@ -12,6 +12,7 @@ fn make_admin_state(registry: Arc<BackendRegistry>) -> Arc<AdminState> {
     Arc::new(AdminState::new(
         registry,
         Vec::new(),
+        Arc::new(flarion::config::FlarionConfig::default()),
         "127.0.0.1:0".to_string(),
         1000,
     ))
@@ -289,6 +290,7 @@ async fn admin_routes_returns_configured_routes() {
                 first_token_timeout_ms: None,
             }],
         }],
+        Arc::new(flarion::config::FlarionConfig::default()),
         "127.0.0.1:0".to_string(),
         1000,
     ));
@@ -332,4 +334,44 @@ async fn admin_routes_empty_when_no_routes_configured() {
     let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
     let v: Vec<flarion::admin::types::Route> = serde_json::from_slice(&body).unwrap();
     assert!(v.is_empty());
+}
+
+#[tokio::test]
+async fn admin_config_redacts_api_keys() {
+    use flarion::config::{FlarionConfig, ServerConfig};
+
+    let cfg = FlarionConfig {
+        server: ServerConfig {
+            api_keys: vec!["secret-key".into()],
+            ..ServerConfig::default()
+        },
+        ..FlarionConfig::default()
+    };
+    let registry = Arc::new(BackendRegistry::new());
+    let admin = Arc::new(AdminState::new(
+        registry.clone(),
+        Vec::new(),
+        Arc::new(cfg.clone()),
+        "127.0.0.1:0".to_string(),
+        1000,
+    ));
+    // Pass ServerConfig::default() (no api_keys) to the router so no auth is
+    // required for the test request; the config stored in AdminState still
+    // contains the secret key that should be redacted.
+    let app = create_router_with_admin(
+        registry,
+        admin,
+        &ServerConfig::default(),
+        &MetricsConfig::default(),
+        None,
+    );
+    let resp = app.oneshot(
+        Request::builder().uri("/v1/admin/config").body(Body::empty()).unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let keys = v.pointer("/server/api_keys").and_then(|k| k.as_array()).expect("api_keys array");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].as_str().unwrap(), "***");
 }

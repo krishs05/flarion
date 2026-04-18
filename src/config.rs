@@ -1,5 +1,5 @@
 use clap::Parser;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -27,7 +27,7 @@ pub struct Cli {
     pub log_level: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct FlarionConfig {
     pub server: ServerConfig,
     pub models: Vec<ModelConfig>,
@@ -39,7 +39,7 @@ pub struct FlarionConfig {
     pub logging: LoggingConfig,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RouteConfig {
     pub id: String,
     pub first_token_timeout_ms: Option<u64>,
@@ -47,7 +47,7 @@ pub struct RouteConfig {
     pub rules: Vec<RuleConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RuleConfig {
     pub name: String,
     #[serde(default)]
@@ -57,7 +57,7 @@ pub struct RuleConfig {
     pub first_token_timeout_ms: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct Matchers {
     pub stream: Option<bool>,
     pub prompt_tokens_gte: Option<u32>,
@@ -84,7 +84,7 @@ impl Matchers {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct MetricsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -121,6 +121,18 @@ pub enum VramBudgetSetting {
     Fixed(u64),
 }
 
+impl serde::Serialize for VramBudgetSetting {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            VramBudgetSetting::Auto => serializer.serialize_str("auto"),
+            VramBudgetSetting::Fixed(n) => serializer.serialize_u64(*n),
+        }
+    }
+}
+
 impl Default for VramBudgetSetting {
     fn default() -> Self {
         VramBudgetSetting::Fixed(0)
@@ -149,7 +161,7 @@ impl<'de> serde::Deserialize<'de> for VramBudgetSetting {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ServerConfig {
     #[serde(default = "default_host")]
     pub host: String,
@@ -323,7 +335,7 @@ impl ServerConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct ModelConfig {
     pub id: String,
     pub backend: BackendType,
@@ -387,7 +399,7 @@ pub struct ModelConfig {
     pub adapters: Vec<AdapterConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendType {
     Local,
@@ -401,7 +413,7 @@ pub enum BackendType {
 ///
 /// `bf16` / `fp16` load safetensors as-is. Q4/Q8 variants use Candle's
 /// `quantized` module (GGUF-flavor quantization).
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Dtype {
     Bf16,
@@ -417,7 +429,7 @@ pub enum Dtype {
 /// LoRA adapter loaded at model load time (merge-only in Wave 7).
 ///
 /// Exactly one of `path` or `repo` must be set. Scale defaults to `1.0`.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct AdapterConfig {
     pub path: Option<PathBuf>,
     pub repo: Option<String>,
@@ -430,7 +442,7 @@ fn default_adapter_scale() -> f32 {
     1.0
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,

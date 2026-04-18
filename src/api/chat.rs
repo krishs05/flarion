@@ -451,7 +451,7 @@ mod admin_emission_tests {
         let mut reg = BackendRegistry::new();
         reg.insert("m".into(), Arc::new(MockBackend::succeeding("m", "hello")));
         let registry = Arc::new(reg);
-        let admin = Arc::new(AdminState::new(registry.clone(), Vec::new(), "127.0.0.1:0".into(), 100));
+        let admin = Arc::new(AdminState::new(registry.clone(), Vec::new(), Arc::new(crate::config::FlarionConfig::default()), "127.0.0.1:0".into(), 100));
 
         let state = crate::server::ApiState {
             registry: registry.clone(),
@@ -494,7 +494,7 @@ mod admin_emission_tests {
             vec!["hel".into(), "lo".into()],
         )));
         let registry = Arc::new(reg);
-        let admin = Arc::new(AdminState::new(registry.clone(), Vec::new(), "127.0.0.1:0".into(), 100));
+        let admin = Arc::new(AdminState::new(registry.clone(), Vec::new(), Arc::new(crate::config::FlarionConfig::default()), "127.0.0.1:0".into(), 100));
 
         let state = crate::server::ApiState {
             registry: registry.clone(),
