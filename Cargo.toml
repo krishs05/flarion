@@ -34,11 +34,13 @@ metrics-exporter-prometheus = { version = "0.17", default-features = false }
 url = "2"
 nvml-wrapper = "0.10"
 dashmap = "6"
+dirs = "5"
 
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+wiremock = "0.6"
 
 [features]
 default = []
