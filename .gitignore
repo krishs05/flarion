@@ -37,3 +37,6 @@ Thumbs.db
 /docs/superpowers/
 /.planning/
 /.claude/
+
+# Git worktrees (local-only isolated workspaces)
+/.worktrees/
