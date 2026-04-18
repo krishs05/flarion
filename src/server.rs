@@ -10,6 +10,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::admin::admin_router;
 use crate::auth::{AuthState, auth_middleware};
 use crate::config::{MetricsConfig, ServerConfig};
 use crate::engine::registry::BackendRegistry;
@@ -80,6 +81,54 @@ pub fn create_router(
         ))
         .layer(build_cors_layer(server_cfg))
         .with_state(registry)
+}
+
+pub fn create_router_with_admin(
+    registry: Arc<BackendRegistry>,
+    admin_state: Arc<crate::admin::state::AdminState>,
+    server_cfg: &ServerConfig,
+    metrics_cfg: &MetricsConfig,
+    metrics_handle: Option<Arc<PrometheusHandle>>,
+) -> Router {
+    let auth_state = AuthState {
+        api_keys: Arc::new(server_cfg.api_keys.clone()),
+    };
+
+    // Build the API sub-router and resolve its state to `Router<()>` so it
+    // can be merged with the admin router (which has its own state type).
+    let mut api = Router::new()
+        .route("/health", get(crate::api::health::health_check))
+        .route("/v1/models", get(crate::api::models::list_models))
+        .route(
+            "/v1/chat/completions",
+            post(crate::api::chat::chat_completions),
+        );
+
+    // Only mount /metrics here if no dedicated bind is configured.
+    if metrics_cfg.enabled
+        && metrics_cfg.bind.is_none()
+        && let Some(handle) = metrics_handle
+    {
+        api = api.route(
+            metrics_cfg.path.as_str(),
+            get(crate::metrics::metrics_handler).with_state(handle),
+        );
+    }
+
+    // Resolve state on both sub-routers, then merge them into a single
+    // `Router<()>` before applying the shared auth + middleware layers.
+    let app = api
+        .with_state(registry)
+        .merge(admin_router(admin_state));
+
+    app.layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .layer(from_fn_with_state(auth_state, auth_middleware))
+        .layer(TraceLayer::new_for_http())
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(300),
+        ))
+        .layer(build_cors_layer(server_cfg))
 }
 
 #[cfg(test)]
