@@ -41,5 +41,8 @@ Thumbs.db
 # Git worktrees (local-only isolated workspaces)
 /.worktrees/
 
+# Release artifact staging (populated by build scripts, not source)
+/dist/
+
 # Local AI-assistant guidance (kept out of the public repo)
 /CLAUDE.md
