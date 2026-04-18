@@ -37,6 +37,8 @@ pub struct FlarionConfig {
     pub metrics: MetricsConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub admin: AdminConfig,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -456,6 +458,20 @@ impl Default for LoggingConfig {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct AdminConfig {
+    #[serde(default = "default_request_history_size")]
+    pub request_history_size: usize,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            request_history_size: default_request_history_size(),
+        }
+    }
+}
+
 fn default_host() -> String {
     "0.0.0.0".to_string()
 }
@@ -470,6 +486,9 @@ fn default_gpu_layers() -> u32 {
 }
 fn default_log_level() -> String {
     "info".to_string()
+}
+fn default_request_history_size() -> usize {
+    1000
 }
 fn default_shutdown_grace_secs() -> u64 {
     30
@@ -3411,6 +3430,7 @@ path = "/tmp/m.gguf"
             server: ServerConfig::default(),
             logging: LoggingConfig::default(),
             metrics: crate::config::MetricsConfig::default(),
+            admin: AdminConfig::default(),
             models: vec![m],
             routes: Vec::new(),
         }
@@ -3498,5 +3518,46 @@ path = "/tmp/m.gguf"
             ),
             "got: {err:?}"
         );
+    }
+
+    #[test]
+    fn config_without_admin_section_uses_defaults() {
+        let toml_str = r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[[models]]
+id = "test-model"
+backend = "local"
+path = "/tmp/model.gguf"
+"#;
+        let cfg: FlarionConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.admin.request_history_size, 1000);
+    }
+
+    #[test]
+    fn config_with_admin_section_honors_override() {
+        let toml_str = r#"
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[[models]]
+id = "test-model"
+backend = "local"
+path = "/tmp/model.gguf"
+
+[admin]
+request_history_size = 250
+"#;
+        let cfg: FlarionConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.admin.request_history_size, 250);
+    }
+
+    #[test]
+    fn admin_config_default_value_is_1000() {
+        let ac = AdminConfig::default();
+        assert_eq!(ac.request_history_size, 1000);
     }
 }
