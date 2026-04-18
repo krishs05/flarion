@@ -9,7 +9,12 @@ use flarion::engine::registry::BackendRegistry;
 use flarion::server::create_router_with_admin;
 
 fn make_admin_state(registry: Arc<BackendRegistry>) -> Arc<AdminState> {
-    Arc::new(AdminState::new(registry, "127.0.0.1:0".to_string(), 1000))
+    Arc::new(AdminState::new(
+        registry,
+        Vec::new(),
+        "127.0.0.1:0".to_string(),
+        1000,
+    ))
 }
 
 #[tokio::test]
@@ -265,4 +270,66 @@ async fn admin_requests_stream_delivers_events() {
     let text = std::str::from_utf8(&bytes).unwrap();
     assert!(text.contains("data:"), "expected 'data:' in SSE frame, got: {text}");
     assert!(text.contains("\"event\":\"started\""), "expected started event, got: {text}");
+}
+
+#[tokio::test]
+async fn admin_routes_returns_configured_routes() {
+    use flarion::config::{RouteConfig, RuleConfig, Matchers};
+
+    let registry = Arc::new(BackendRegistry::new());
+    let admin = Arc::new(AdminState::new(
+        registry.clone(),
+        vec![RouteConfig {
+            id: "chat".into(),
+            first_token_timeout_ms: None,
+            rules: vec![RuleConfig {
+                name: "fallback".into(),
+                matchers: Matchers::default(),
+                targets: vec!["small".into()],
+                first_token_timeout_ms: None,
+            }],
+        }],
+        "127.0.0.1:0".to_string(),
+        1000,
+    ));
+
+    let app = create_router_with_admin(
+        registry,
+        admin,
+        &ServerConfig::default(),
+        &MetricsConfig::default(),
+        None,
+    );
+    let resp = app.oneshot(
+        Request::builder().uri("/v1/admin/routes").body(Body::empty()).unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let v: Vec<flarion::admin::types::Route> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v.len(), 1);
+    assert_eq!(v[0].id, "chat");
+    assert_eq!(v[0].rules.len(), 1);
+    assert_eq!(v[0].rules[0].name, "fallback");
+    assert_eq!(v[0].rules[0].hit_count, 0);
+    assert_eq!(v[0].fallback_count, 0);
+}
+
+#[tokio::test]
+async fn admin_routes_empty_when_no_routes_configured() {
+    let registry = Arc::new(BackendRegistry::new());
+    let admin = make_admin_state(registry.clone());
+    let app = create_router_with_admin(
+        registry,
+        admin,
+        &ServerConfig::default(),
+        &MetricsConfig::default(),
+        None,
+    );
+    let resp = app.oneshot(
+        Request::builder().uri("/v1/admin/routes").body(Body::empty()).unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+    let v: Vec<flarion::admin::types::Route> = serde_json::from_slice(&body).unwrap();
+    assert!(v.is_empty());
 }

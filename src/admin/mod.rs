@@ -22,5 +22,6 @@ pub fn admin_router(state: Arc<AdminState>) -> Router {
         .route("/v1/admin/models", get(models::get_models))
         .route("/v1/admin/requests", get(requests::get_requests))
         .route("/v1/admin/requests/stream", get(requests::stream_requests))
+        .route("/v1/admin/routes", get(routes::get_routes))
         .with_state(state)
 }
