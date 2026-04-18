@@ -1,11 +1,12 @@
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{Method, Request, StatusCode, header};
 use tower::ServiceExt;
 use std::sync::Arc;
 
 use flarion::admin::state::AdminState;
 use flarion::config::{MetricsConfig, ServerConfig};
 use flarion::engine::registry::BackendRegistry;
+use flarion::engine::testing::MockBackend;
 use flarion::server::create_router_with_admin;
 
 fn make_admin_state(registry: Arc<BackendRegistry>) -> Arc<AdminState> {
@@ -374,4 +375,137 @@ async fn admin_config_redacts_api_keys() {
     let keys = v.pointer("/server/api_keys").and_then(|k| k.as_array()).expect("api_keys array");
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].as_str().unwrap(), "***");
+}
+
+fn make_registry_with(id: &str, reply: &str) -> Arc<BackendRegistry> {
+    let mut reg = BackendRegistry::new();
+    reg.insert(id.to_string(), Arc::new(MockBackend::succeeding(id, reply)));
+    Arc::new(reg)
+}
+
+#[tokio::test]
+async fn admin_load_unknown_model_returns_404() {
+    let registry = Arc::new(BackendRegistry::new());
+    let admin = make_admin_state(registry.clone());
+    let app = create_router_with_admin(
+        registry,
+        admin,
+        &ServerConfig::default(),
+        &MetricsConfig::default(),
+        None,
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/admin/models/nope/load")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn admin_load_known_model_returns_200() {
+    let registry = make_registry_with("m", "ok");
+    let admin = make_admin_state(registry.clone());
+    let app = create_router_with_admin(
+        registry,
+        admin,
+        &ServerConfig::default(),
+        &MetricsConfig::default(),
+        None,
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/admin/models/m/load")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_unload_busy_model_returns_409() {
+    let registry = make_registry_with("m", "ok");
+    let admin = make_admin_state(registry.clone());
+    admin.tracker.in_flight_inc("m"); // simulate in-flight
+    let app = create_router_with_admin(
+        registry,
+        admin,
+        &ServerConfig::default(),
+        &MetricsConfig::default(),
+        None,
+    );
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/admin/models/m/unload")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn admin_pin_idempotent() {
+    let registry = make_registry_with("m", "ok");
+    let admin = make_admin_state(registry.clone());
+    let app = create_router_with_admin(
+        registry,
+        admin,
+        &ServerConfig::default(),
+        &MetricsConfig::default(),
+        None,
+    );
+    for _ in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/admin/models/m/pin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test]
+async fn admin_unpin_idempotent() {
+    let registry = make_registry_with("m", "ok");
+    let admin = make_admin_state(registry.clone());
+    let app = create_router_with_admin(
+        registry,
+        admin,
+        &ServerConfig::default(),
+        &MetricsConfig::default(),
+        None,
+    );
+    for _ in 0..2 {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/admin/models/m/unpin")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
 }
