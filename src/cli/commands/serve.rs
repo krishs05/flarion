@@ -143,14 +143,24 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         backend.bind_evictor(evictor_weak.clone()).await;
     }
 
-    let app = server::create_router(
+    let main_addr = format!("{}:{}", config.server.host, config.server.port);
+
+    let admin_state = Arc::new(crate::admin::state::AdminState::new(
         registry.clone(),
+        config.routes.clone(),
+        Arc::new(config.clone()),
+        main_addr.clone(),
+        config.admin.request_history_size,
+    ));
+
+    let app = server::create_router_with_admin(
+        registry.clone(),
+        admin_state,
         &config.server,
         &config.metrics,
         metrics_handle.clone(),
     );
 
-    let main_addr = format!("{}:{}", config.server.host, config.server.port);
     let main_listener = tokio::net::TcpListener::bind(&main_addr).await?;
     tracing::info!("listening on {main_addr}");
 
