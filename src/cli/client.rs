@@ -72,4 +72,35 @@ impl FlarionClient {
     pub async fn version(&self) -> Result<BuildInfo, ClientError> {
         self.get("/v1/admin/version").await
     }
+
+    pub async fn health(&self) -> Result<serde_json::Value, ClientError> {
+        self.get("/health").await
+    }
+
+    pub async fn status(&self) -> Result<crate::admin::types::Status, ClientError> {
+        self.get("/v1/admin/status").await
+    }
+
+    pub async fn gpus(&self) -> Result<Vec<crate::admin::types::Gpu>, ClientError> {
+        self.get("/v1/admin/gpus").await
+    }
+
+    pub async fn models(&self) -> Result<Vec<crate::admin::types::Model>, ClientError> {
+        self.get("/v1/admin/models").await
+    }
+
+    pub async fn routes(&self) -> Result<Vec<crate::admin::types::Route>, ClientError> {
+        self.get("/v1/admin/routes").await
+    }
+
+    pub async fn requests(
+        &self,
+        tail: usize,
+    ) -> Result<Vec<crate::admin::types::RequestEvent>, ClientError> {
+        self.get(&format!("/v1/admin/requests?tail={tail}")).await
+    }
+
+    pub async fn effective_config(&self) -> Result<serde_json::Value, ClientError> {
+        self.get("/v1/admin/config").await
+    }
 }
