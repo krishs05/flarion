@@ -28,6 +28,7 @@
 - [Local Models & File Formats](#local-models--file-formats)
 - [Cloud Backends](#cloud-backends)
 - [Smart Routing](#smart-routing)
+- [CLI](#cli)
 - [Dashboard UI](#dashboard-ui)
 - [API](#api)
 - [Streaming](#streaming)
@@ -201,6 +202,30 @@ first_token_timeout_ms = 5000
 - `X-Flarion-Fallback-Count` — how many backends failed before this one
 
 **Validation.** Route and model ids share one namespace; startup fails on collisions. Every route must include a catch-all (`matchers = {}`) rule.
+
+## CLI
+
+Beyond serving, the `flarion` binary exposes subcommands for inspecting a running server.
+
+Register an endpoint:
+
+```bash
+flarion endpoints add home --url http://127.0.0.1:8080
+# or, interactive:
+flarion login home
+```
+
+Inspect server state:
+
+```bash
+flarion status                       # human-readable: version, GPUs, models, 60s rollup
+flarion status --json | jq           # pipeable JSON for scripting
+flarion endpoints test               # ping + version + latency for every saved endpoint
+```
+
+Endpoints persist in `~/.config/flarion/config.toml` (Unix) or `%APPDATA%\flarion\config.toml` (Windows). Each can be named — handy for switching between a local dev server and a remote GPU host. Secrets can come from env vars (`api_key = "${MY_KEY}"`) or a shell command (`api_key_cmd = "op read op://vault/flarion/key"`).
+
+A full TUI dashboard and `flarion chat` arrive in a follow-up phase. This phase ships the admin API (`/v1/admin/*`) and the scripting surface that sits on top of it.
 
 ## Dashboard UI
 
