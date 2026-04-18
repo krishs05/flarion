@@ -46,44 +46,40 @@ impl CachedClient {
     }
 
     pub async fn status(&self) -> Result<Status, ClientError> {
-        if let Some(c) = self.status.read().await.as_ref() {
-            if c.is_fresh() {
+        if let Some(c) = self.status.read().await.as_ref()
+            && c.is_fresh() {
                 return Ok(c.value.clone());
             }
-        }
         let fresh = self.inner.status().await?;
         *self.status.write().await = Some(Cached { value: fresh.clone(), fetched_at: Instant::now() });
         Ok(fresh)
     }
 
     pub async fn gpus(&self) -> Result<Vec<Gpu>, ClientError> {
-        if let Some(c) = self.gpus.read().await.as_ref() {
-            if c.is_fresh() {
+        if let Some(c) = self.gpus.read().await.as_ref()
+            && c.is_fresh() {
                 return Ok(c.value.clone());
             }
-        }
         let fresh = self.inner.gpus().await?;
         *self.gpus.write().await = Some(Cached { value: fresh.clone(), fetched_at: Instant::now() });
         Ok(fresh)
     }
 
     pub async fn models(&self) -> Result<Vec<Model>, ClientError> {
-        if let Some(c) = self.models.read().await.as_ref() {
-            if c.is_fresh() {
+        if let Some(c) = self.models.read().await.as_ref()
+            && c.is_fresh() {
                 return Ok(c.value.clone());
             }
-        }
         let fresh = self.inner.models().await?;
         *self.models.write().await = Some(Cached { value: fresh.clone(), fetched_at: Instant::now() });
         Ok(fresh)
     }
 
     pub async fn routes(&self) -> Result<Vec<Route>, ClientError> {
-        if let Some(c) = self.routes.read().await.as_ref() {
-            if c.is_fresh() {
+        if let Some(c) = self.routes.read().await.as_ref()
+            && c.is_fresh() {
                 return Ok(c.value.clone());
             }
-        }
         let fresh = self.inner.routes().await?;
         *self.routes.write().await = Some(Cached { value: fresh.clone(), fetched_at: Instant::now() });
         Ok(fresh)

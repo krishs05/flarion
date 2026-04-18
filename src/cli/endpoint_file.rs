@@ -120,8 +120,10 @@ mod tests {
     #[test]
     fn save_then_load_roundtrip() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let mut f = EndpointFile::default();
-        f.default = Some("home".into());
+        let mut f = EndpointFile {
+            default: Some("home".into()),
+            ..Default::default()
+        };
         f.endpoints.insert("home".into(), EndpointEntry {
             url: "http://127.0.0.1:8080".into(),
             api_key: None,

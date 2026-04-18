@@ -102,12 +102,11 @@ impl RequestTracker {
                 crate::admin::types::RequestEvent::Failed { ts, .. } => (ts, true, true),
                 _ => continue,
             };
-            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
-                if parsed >= cutoff && is_terminal {
+            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts)
+                && parsed >= cutoff && is_terminal {
                     req_count += 1;
                     if is_error { err_count += 1; }
                 }
-            }
         }
         ttfts.sort_unstable();
         let percentile = |pct: f64| -> Option<u64> {

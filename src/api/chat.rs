@@ -105,11 +105,10 @@ impl InFlightStreamGuard {
 /// the counter. No event is emitted because Drop can't `.await`.
 impl Drop for InFlightStreamGuard {
     fn drop(&mut self) {
-        if self.armed {
-            if let Some(admin) = &self.admin {
+        if self.armed
+            && let Some(admin) = &self.admin {
                 admin.tracker.in_flight_dec(&self.model_id);
             }
-        }
     }
 }
 

@@ -28,25 +28,22 @@ pub fn resolve(args: &ResolveArgs, file: Option<&EndpointFile>) -> Result<Endpoi
         });
     }
     // 3. Named endpoint from file
-    if let (Some(name), Some(f)) = (&args.endpoint_name, file) {
-        if let Some(entry) = f.endpoints.get(name) {
+    if let (Some(name), Some(f)) = (&args.endpoint_name, file)
+        && let Some(entry) = f.endpoints.get(name) {
             return entry.resolve(name).map_err(|e| ClientError::Server {
                 status: 0,
                 body: e.to_string(),
             });
         }
-    }
     // 4. Default endpoint from file
-    if let Some(f) = file {
-        if let Some(name) = &f.default {
-            if let Some(entry) = f.endpoints.get(name) {
-                return entry.resolve(name).map_err(|e| ClientError::Server {
-                    status: 0,
-                    body: e.to_string(),
-                });
-            }
+    if let Some(f) = file
+        && let Some(name) = &f.default
+        && let Some(entry) = f.endpoints.get(name) {
+            return entry.resolve(name).map_err(|e| ClientError::Server {
+                status: 0,
+                body: e.to_string(),
+            });
         }
-    }
     // 5. Local flarion.toml
     if let Ok(cfg) = crate::config::FlarionConfig::load(std::path::Path::new("flarion.toml")) {
         return Ok(Endpoint {
@@ -112,8 +109,10 @@ mod tests {
 
     #[test]
     fn default_endpoint_used_when_no_flags_or_name() {
-        let mut f = EndpointFile::default();
-        f.default = Some("home".into());
+        let mut f = EndpointFile {
+            default: Some("home".into()),
+            ..Default::default()
+        };
         f.endpoints.insert(
             "home".into(),
             EndpointEntry {

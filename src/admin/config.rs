@@ -44,11 +44,10 @@ fn redact_secret(v: &mut Value) {
         }
         Value::Array(arr) => {
             for el in arr.iter_mut() {
-                if let Value::String(s) = el {
-                    if !(s.starts_with("${") && s.ends_with('}')) {
+                if let Value::String(s) = el
+                    && !(s.starts_with("${") && s.ends_with('}')) {
                         *s = "***".into();
                     }
-                }
             }
         }
         _ => {}
