@@ -4,7 +4,6 @@ use std::time::Instant;
 use crate::admin::tracker::RequestTracker;
 use crate::engine::registry::BackendRegistry;
 
-#[allow(dead_code)]
 pub struct AdminState {
     pub registry: Arc<BackendRegistry>,
     pub bind: String,

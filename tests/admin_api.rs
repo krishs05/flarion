@@ -8,12 +8,8 @@ use flarion::config::{MetricsConfig, ServerConfig};
 use flarion::engine::registry::BackendRegistry;
 use flarion::server::create_router_with_admin;
 
-fn empty_admin_state() -> Arc<AdminState> {
-    Arc::new(AdminState::new(
-        Arc::new(BackendRegistry::new()),
-        "127.0.0.1:0".to_string(),
-        1000,
-    ))
+fn make_admin_state(registry: Arc<BackendRegistry>) -> Arc<AdminState> {
+    Arc::new(AdminState::new(registry, "127.0.0.1:0".to_string(), 1000))
 }
 
 #[tokio::test]
@@ -22,9 +18,11 @@ async fn admin_ping_requires_auth_when_keys_set() {
         api_keys: vec!["k".into()],
         ..ServerConfig::default()
     };
+    let registry = Arc::new(BackendRegistry::new());
+    let admin = make_admin_state(registry.clone());
     let app = create_router_with_admin(
-        Arc::new(BackendRegistry::new()),
-        empty_admin_state(),
+        registry,
+        admin,
         &server_cfg,
         &MetricsConfig::default(),
         None,
@@ -47,9 +45,11 @@ async fn admin_ping_passes_with_key() {
         api_keys: vec!["k".into()],
         ..ServerConfig::default()
     };
+    let registry = Arc::new(BackendRegistry::new());
+    let admin = make_admin_state(registry.clone());
     let app = create_router_with_admin(
-        Arc::new(BackendRegistry::new()),
-        empty_admin_state(),
+        registry,
+        admin,
         &server_cfg,
         &MetricsConfig::default(),
         None,

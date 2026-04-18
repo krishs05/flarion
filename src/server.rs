@@ -42,16 +42,17 @@ fn build_cors_layer(server: &ServerConfig) -> CorsLayer {
     CorsLayer::new()
 }
 
-pub fn create_router(
+/// Build the API sub-router with state already resolved to `Router<()>`.
+///
+/// Mounts `/health`, `/v1/models`, `/v1/chat/completions`, and — when
+/// `metrics_cfg` says so — the metrics endpoint on the main listener.
+/// Returning `Router<()>` lets callers merge additional routers (e.g. admin)
+/// before adding shared middleware layers.
+fn api_sub_router(
     registry: Arc<BackendRegistry>,
-    server_cfg: &ServerConfig,
     metrics_cfg: &MetricsConfig,
     metrics_handle: Option<Arc<PrometheusHandle>>,
 ) -> Router {
-    let auth_state = AuthState {
-        api_keys: Arc::new(server_cfg.api_keys.clone()),
-    };
-
     let mut app = Router::new()
         .route("/health", get(crate::api::health::health_check))
         .route("/v1/models", get(crate::api::models::list_models))
@@ -72,7 +73,21 @@ pub fn create_router(
         );
     }
 
-    app.layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+    app.with_state(registry)
+}
+
+pub fn create_router(
+    registry: Arc<BackendRegistry>,
+    server_cfg: &ServerConfig,
+    metrics_cfg: &MetricsConfig,
+    metrics_handle: Option<Arc<PrometheusHandle>>,
+) -> Router {
+    let auth_state = AuthState {
+        api_keys: Arc::new(server_cfg.api_keys.clone()),
+    };
+
+    api_sub_router(registry, metrics_cfg, metrics_handle)
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(from_fn_with_state(auth_state, auth_middleware))
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(
@@ -80,7 +95,6 @@ pub fn create_router(
             Duration::from_secs(300),
         ))
         .layer(build_cors_layer(server_cfg))
-        .with_state(registry)
 }
 
 pub fn create_router_with_admin(
@@ -94,31 +108,9 @@ pub fn create_router_with_admin(
         api_keys: Arc::new(server_cfg.api_keys.clone()),
     };
 
-    // Build the API sub-router and resolve its state to `Router<()>` so it
-    // can be merged with the admin router (which has its own state type).
-    let mut api = Router::new()
-        .route("/health", get(crate::api::health::health_check))
-        .route("/v1/models", get(crate::api::models::list_models))
-        .route(
-            "/v1/chat/completions",
-            post(crate::api::chat::chat_completions),
-        );
-
-    // Only mount /metrics here if no dedicated bind is configured.
-    if metrics_cfg.enabled
-        && metrics_cfg.bind.is_none()
-        && let Some(handle) = metrics_handle
-    {
-        api = api.route(
-            metrics_cfg.path.as_str(),
-            get(crate::metrics::metrics_handler).with_state(handle),
-        );
-    }
-
-    // Resolve state on both sub-routers, then merge them into a single
-    // `Router<()>` before applying the shared auth + middleware layers.
-    let app = api
-        .with_state(registry)
+    // Merge the admin router into the already-state-resolved API sub-router,
+    // producing a single `Router<()>` before shared middleware is applied.
+    let app = api_sub_router(registry, metrics_cfg, metrics_handle)
         .merge(admin_router(admin_state));
 
     app.layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
