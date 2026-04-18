@@ -103,4 +103,53 @@ impl FlarionClient {
     pub async fn effective_config(&self) -> Result<serde_json::Value, ClientError> {
         self.get("/v1/admin/config").await
     }
+
+    async fn post_empty(&self, path: &str) -> Result<(), ClientError> {
+        let url = format!("{}{}", self.endpoint.url.trim_end_matches('/'), path);
+        let mut req = self.http.post(&url);
+        if let Some(k) = &self.endpoint.api_key {
+            req = req.bearer_auth(k);
+        }
+        let resp = req.send().await.map_err(|e| {
+            if e.is_timeout() {
+                ClientError::Timeout
+            } else {
+                ClientError::Unreachable {
+                    url: url.clone(),
+                    source: e,
+                }
+            }
+        })?;
+        match resp.status() {
+            s if s.is_success() => Ok(()),
+            StatusCode::UNAUTHORIZED => Err(ClientError::Unauthorized),
+            StatusCode::NOT_FOUND => Err(ClientError::NotFound {
+                resource: path.into(),
+            }),
+            StatusCode::CONFLICT => {
+                let body = resp.text().await.unwrap_or_default();
+                Err(ClientError::Conflict { reason: body })
+            }
+            status => {
+                let body = resp.text().await.unwrap_or_default();
+                Err(ClientError::Server {
+                    status: status.as_u16(),
+                    body,
+                })
+            }
+        }
+    }
+
+    pub async fn load_model(&self, id: &str) -> Result<(), ClientError> {
+        self.post_empty(&format!("/v1/admin/models/{id}/load")).await
+    }
+
+    pub async fn unload_model(&self, id: &str) -> Result<(), ClientError> {
+        self.post_empty(&format!("/v1/admin/models/{id}/unload")).await
+    }
+
+    pub async fn pin_model(&self, id: &str, pinned: bool) -> Result<(), ClientError> {
+        let action = if pinned { "pin" } else { "unpin" };
+        self.post_empty(&format!("/v1/admin/models/{id}/{action}")).await
+    }
 }

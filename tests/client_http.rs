@@ -177,3 +177,60 @@ async fn health_returns_json() {
     let v = c.health().await.unwrap();
     assert_eq!(v.get("status").and_then(|v| v.as_str()), Some("ok"));
 }
+
+#[tokio::test]
+async fn load_model_success() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/admin/models/m/load"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"loaded":"m"})))
+        .mount(&server).await;
+    let c = FlarionClient::new(mk_endpoint(server.uri())).unwrap();
+    c.load_model("m").await.unwrap();
+}
+
+#[tokio::test]
+async fn load_model_maps_404_to_not_found() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/admin/models/nope/load"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server).await;
+    let c = FlarionClient::new(mk_endpoint(server.uri())).unwrap();
+    let err = c.load_model("nope").await.unwrap_err();
+    assert!(matches!(err, ClientError::NotFound { .. }), "got: {err:?}");
+}
+
+#[tokio::test]
+async fn unload_model_maps_409_to_conflict() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/admin/models/m/unload"))
+        .respond_with(ResponseTemplate::new(409).set_body_string("busy"))
+        .mount(&server).await;
+    let c = FlarionClient::new(mk_endpoint(server.uri())).unwrap();
+    let err = c.unload_model("m").await.unwrap_err();
+    assert!(matches!(err, ClientError::Conflict { .. }), "got: {err:?}");
+}
+
+#[tokio::test]
+async fn pin_model_true_hits_pin_path() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/admin/models/m/pin"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server).await;
+    let c = FlarionClient::new(mk_endpoint(server.uri())).unwrap();
+    c.pin_model("m", true).await.unwrap();
+}
+
+#[tokio::test]
+async fn pin_model_false_hits_unpin_path() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/admin/models/m/unpin"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server).await;
+    let c = FlarionClient::new(mk_endpoint(server.uri())).unwrap();
+    c.pin_model("m", false).await.unwrap();
+}
