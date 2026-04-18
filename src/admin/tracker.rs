@@ -85,6 +85,45 @@ impl RequestTracker {
             .map(|e| e.value().load(Ordering::SeqCst) as u64)
             .sum()
     }
+
+    pub async fn recent_rollup(&self) -> crate::admin::types::RecentRollup {
+        let now = chrono::Utc::now();
+        let cutoff = now - chrono::Duration::seconds(60);
+        let all = self.snapshot_all().await;
+        let mut req_count = 0u64;
+        let mut err_count = 0u64;
+        let mut ttfts: Vec<u64> = Vec::new();
+        for ev in all.iter() {
+            let (ts, is_terminal, is_error) = match ev {
+                crate::admin::types::RequestEvent::Completed { ts, ttft_ms, .. } => {
+                    if let Some(t) = ttft_ms { ttfts.push(*t); }
+                    (ts, true, false)
+                }
+                crate::admin::types::RequestEvent::Failed { ts, .. } => (ts, true, true),
+                _ => continue,
+            };
+            if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(ts) {
+                if parsed >= cutoff && is_terminal {
+                    req_count += 1;
+                    if is_error { err_count += 1; }
+                }
+            }
+        }
+        ttfts.sort_unstable();
+        let percentile = |pct: f64| -> Option<u64> {
+            if ttfts.is_empty() { None }
+            else {
+                let idx = ((ttfts.len() as f64 - 1.0) * pct).round() as usize;
+                Some(ttfts[idx])
+            }
+        };
+        crate::admin::types::RecentRollup {
+            requests_last_60s: req_count,
+            errors_last_60s: err_count,
+            ttft_p50_ms: percentile(0.50),
+            ttft_p95_ms: percentile(0.95),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -159,5 +198,32 @@ mod tests {
         t.record(started("b")).await;
         let snap = t.snapshot_all().await;
         assert_eq!(snap.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recent_rollup_counts_only_terminal_events_in_window() {
+        let t = RequestTracker::new(10);
+        // Recent Completed — counts
+        t.record(crate::admin::types::RequestEvent::Completed {
+            id: "a".into(), ts: chrono::Utc::now().to_rfc3339(),
+            route: None, matched_rule: None, backend: "m".into(),
+            fallback_count: 0, status: "ok".into(),
+            ttft_ms: Some(100), duration_ms: 200,
+            prompt_tokens: 0, completion_tokens: 0,
+        }).await;
+        // Recent Failed — counts as both request and error
+        t.record(crate::admin::types::RequestEvent::Failed {
+            id: "b".into(), ts: chrono::Utc::now().to_rfc3339(),
+            backend: "m".into(), reason: "x".into(), duration_ms: 50,
+        }).await;
+        // Started — does NOT count toward requests_last_60s (only terminal events count)
+        t.record(crate::admin::types::RequestEvent::Started {
+            id: "c".into(), ts: chrono::Utc::now().to_rfc3339(),
+            route: None, backend: "m".into(),
+        }).await;
+        let r = t.recent_rollup().await;
+        assert_eq!(r.requests_last_60s, 2);
+        assert_eq!(r.errors_last_60s, 1);
+        assert_eq!(r.ttft_p50_ms, Some(100));
     }
 }

@@ -98,3 +98,27 @@ async fn admin_version_returns_build_info() {
         assert!(f == "cuda" || f == "hf_cuda", "unexpected feature: {f}");
     }
 }
+
+#[tokio::test]
+async fn admin_status_returns_shape_with_empty_registry() {
+    let registry = Arc::new(BackendRegistry::new());
+    let admin = make_admin_state(registry.clone());
+    let app = create_router_with_admin(
+        registry,
+        admin,
+        &ServerConfig::default(),
+        &MetricsConfig::default(),
+        None,
+    );
+    let resp = app.oneshot(
+        Request::builder().uri("/v1/admin/status").body(Body::empty()).unwrap(),
+    ).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 65536).await.unwrap();
+    let s: flarion::admin::types::Status = serde_json::from_slice(&body).unwrap();
+    assert_eq!(s.server.version, env!("CARGO_PKG_VERSION"));
+    assert!(s.models.is_empty());
+    assert_eq!(s.in_flight_total, 0);
+    assert_eq!(s.recent.requests_last_60s, 0);
+    assert_eq!(s.recent.errors_last_60s, 0);
+}
