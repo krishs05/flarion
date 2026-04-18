@@ -369,6 +369,22 @@ pub struct ModelConfig {
     /// - `[N, M, ...]` (len ≥ 2) = tensor-parallel split across those devices.
     #[serde(default)]
     pub gpus: Vec<u32>,
+
+    // HF-only
+    /// HF Hub repo id (e.g. `"Qwen/Qwen2.5-32B-Instruct"`). Mutually exclusive
+    /// with `path`. HF backend only.
+    pub repo: Option<String>,
+    /// Git revision / tag for the HF Hub repo. Defaults to `"main"` when unset.
+    pub revision: Option<String>,
+    /// Precision / quantization selection for the HF backend. Unset → default
+    /// picked by the backend at load time (bf16 if device supports it, else fp16).
+    pub dtype: Option<Dtype>,
+    /// Name of the environment variable holding the HF Hub token. Used for gated
+    /// repos. HF backend only.
+    pub hf_token_env: Option<String>,
+    /// LoRA adapters to merge at load time. HF backend only.
+    #[serde(default)]
+    pub adapters: Vec<AdapterConfig>,
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
@@ -378,8 +394,41 @@ pub enum BackendType {
     Openai,
     Groq,
     Anthropic,
+    Hf,
 }
 
+/// Precision / quantization knob for the HF backend.
+///
+/// `bf16` / `fp16` load safetensors as-is. Q4/Q8 variants use Candle's
+/// `quantized` module (GGUF-flavor quantization).
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Dtype {
+    Bf16,
+    Fp16,
+    #[serde(rename = "q4_0")]
+    Q4_0,
+    #[serde(rename = "q4_k_m")]
+    Q4KM,
+    #[serde(rename = "q8_0")]
+    Q8_0,
+}
+
+/// LoRA adapter loaded at model load time (merge-only in Wave 7).
+///
+/// Exactly one of `path` or `repo` must be set. Scale defaults to `1.0`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AdapterConfig {
+    pub path: Option<PathBuf>,
+    pub repo: Option<String>,
+    pub revision: Option<String>,
+    #[serde(default = "default_adapter_scale")]
+    pub scale: f32,
+}
+
+fn default_adapter_scale() -> f32 {
+    1.0
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LoggingConfig {
@@ -426,6 +475,7 @@ fn provider_default_base_url(backend: &BackendType) -> Option<&'static str> {
         BackendType::Groq => Some("https://api.groq.com/openai/v1"),
         BackendType::Anthropic => Some("https://api.anthropic.com/v1"),
         BackendType::Local => None,
+        BackendType::Hf => None,
     }
 }
 
@@ -489,6 +539,22 @@ fn validate_upstream_url(
     Ok(())
 }
 
+fn reject_hf_fields_on_non_hf(m: &ModelConfig) -> Result<(), ConfigError> {
+    let bad_field = if m.repo.is_some() { Some("repo") }
+        else if m.revision.is_some() { Some("revision") }
+        else if m.dtype.is_some() { Some("dtype") }
+        else if m.hf_token_env.is_some() { Some("hf_token_env") }
+        else if !m.adapters.is_empty() { Some("adapters") }
+        else { None };
+    if let Some(field) = bad_field {
+        return Err(ConfigError::HfFieldOnNonHfBackend {
+            id: m.id.clone(),
+            field: field.into(),
+        });
+    }
+    Ok(())
+}
+
 impl FlarionConfig {
     pub fn load(path: &std::path::Path) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(path).map_err(|e| ConfigError::ReadFailed {
@@ -541,6 +607,7 @@ impl FlarionConfig {
         for m in &self.models {
             match m.backend {
                 BackendType::Local => {
+                    reject_hf_fields_on_non_hf(m)?;
                     let path = m
                         .path
                         .as_ref()
@@ -553,6 +620,7 @@ impl FlarionConfig {
                     }
                 }
                 BackendType::Openai | BackendType::Groq | BackendType::Anthropic => {
+                    reject_hf_fields_on_non_hf(m)?;
                     if m.path.is_some() {
                         return Err(ConfigError::PathOnCloudBackend { id: m.id.clone() });
                     }
@@ -579,6 +647,41 @@ impl FlarionConfig {
                         effective_url,
                         self.server.allow_plaintext_upstream,
                     )?;
+                }
+                BackendType::Hf => {
+                    // Exactly one of path / repo.
+                    match (&m.path, &m.repo) {
+                        (Some(_), Some(_)) => {
+                            return Err(ConfigError::HfBackendPathAndRepoExclusive {
+                                id: m.id.clone(),
+                            });
+                        }
+                        (None, None) => {
+                            return Err(ConfigError::HfBackendNeedsPathOrRepo {
+                                id: m.id.clone(),
+                            });
+                        }
+                        _ => {}
+                    }
+
+                    // Each adapter: exactly one of path / repo.
+                    for (index, a) in m.adapters.iter().enumerate() {
+                        match (&a.path, &a.repo) {
+                            (Some(_), Some(_)) => {
+                                return Err(ConfigError::HfAdapterPathAndRepoExclusive {
+                                    id: m.id.clone(),
+                                    index,
+                                });
+                            }
+                            (None, None) => {
+                                return Err(ConfigError::HfAdapterNeedsPathOrRepo {
+                                    id: m.id.clone(),
+                                    index,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
@@ -1069,6 +1172,17 @@ pub enum ConfigError {
         gpu_id: u32,
         detected_count: u32,
     },
+
+    #[error("model '{id}': HF backend requires exactly one of `path` or `repo`")]
+    HfBackendNeedsPathOrRepo { id: String },
+    #[error("model '{id}': HF backend cannot set both `path` and `repo`")]
+    HfBackendPathAndRepoExclusive { id: String },
+    #[error("model '{id}': field `{field}` is only valid on HF backend")]
+    HfFieldOnNonHfBackend { id: String, field: String },
+    #[error("model '{id}': adapter #{index} requires exactly one of `path` or `repo`")]
+    HfAdapterNeedsPathOrRepo { id: String, index: usize },
+    #[error("model '{id}': adapter #{index} cannot set both `path` and `repo`")]
+    HfAdapterPathAndRepoExclusive { id: String, index: usize },
 }
 
 #[cfg(test)]
@@ -1094,6 +1208,11 @@ mod tests {
             vram_mb: None,
             pin: false,
             gpus: vec![],
+            repo: None,
+            revision: None,
+            dtype: None,
+            hf_token_env: None,
+            adapters: Vec::new(),
         }
     }
 
@@ -1116,6 +1235,11 @@ mod tests {
             vram_mb: None,
             pin: false,
             gpus: vec![],
+            repo: None,
+            revision: None,
+            dtype: None,
+            hf_token_env: None,
+            adapters: Vec::new(),
         }
     }
 
@@ -1410,6 +1534,11 @@ path = "/tmp/x.gguf"
                 vram_mb: None,
                 pin: false,
                 gpus: vec![],
+                repo: None,
+                revision: None,
+                dtype: None,
+                hf_token_env: None,
+                adapters: Vec::new(),
             }],
             logging: LoggingConfig::default(),
             ..FlarionConfig::default()
@@ -2412,6 +2541,11 @@ vram_mb = 6000
             vram_mb: None,
             pin: false,
             gpus: vec![],
+            repo: None,
+            revision: None,
+            dtype: None,
+            hf_token_env: None,
+            adapters: Vec::new(),
         }];
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::LazyOnlyForLocal { .. }));
@@ -2439,6 +2573,11 @@ vram_mb = 6000
             vram_mb: Some(1000),
             pin: false,
             gpus: vec![],
+            repo: None,
+            revision: None,
+            dtype: None,
+            hf_token_env: None,
+            adapters: Vec::new(),
         }];
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::VramMbOnlyForLocal { .. }));
@@ -2567,6 +2706,11 @@ vram_mb = 6000
             vram_mb: None,
             pin: true,
             gpus: vec![],
+            repo: None,
+            revision: None,
+            dtype: None,
+            hf_token_env: None,
+            adapters: Vec::new(),
         }];
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -2605,6 +2749,11 @@ vram_mb = 6000
                 vram_mb: None,
                 pin: true,
                 gpus: vec![0],
+                repo: None,
+                revision: None,
+                dtype: None,
+                hf_token_env: None,
+                adapters: Vec::new(),
             },
             ModelConfig {
                 id: "b".into(),
@@ -2624,6 +2773,11 @@ vram_mb = 6000
                 vram_mb: None,
                 pin: true,
                 gpus: vec![0],
+                repo: None,
+                revision: None,
+                dtype: None,
+                hf_token_env: None,
+                adapters: Vec::new(),
             },
             ModelConfig {
                 id: "c".into(),
@@ -2643,6 +2797,11 @@ vram_mb = 6000
                 vram_mb: None,
                 pin: true,
                 gpus: vec![0],
+                repo: None,
+                revision: None,
+                dtype: None,
+                hf_token_env: None,
+                adapters: Vec::new(),
             },
         ];
 
@@ -2826,6 +2985,11 @@ vram_mb = 6000
             vram_mb: None,
             pin: false,
             gpus: vec![0, 1, 0],
+            repo: None,
+            revision: None,
+            dtype: None,
+            hf_token_env: None,
+            adapters: Vec::new(),
         }];
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -2856,6 +3020,11 @@ vram_mb = 6000
             vram_mb: None,
             pin: false,
             gpus: vec![0],
+            repo: None,
+            revision: None,
+            dtype: None,
+            hf_token_env: None,
+            adapters: Vec::new(),
         }];
         let err = cfg.validate().unwrap_err();
         assert!(
@@ -2979,6 +3148,11 @@ vram_mb = 6000
                 vram_mb: None,
                 pin: false,
                 gpus: vec![gpu],
+                repo: None,
+                revision: None,
+                dtype: None,
+                hf_token_env: None,
+                adapters: Vec::new(),
             }
         }
 
@@ -3034,6 +3208,11 @@ vram_mb = 6000
                 vram_mb: None,
                 pin: true,
                 gpus,
+                repo: None,
+                revision: None,
+                dtype: None,
+                hf_token_env: None,
+                adapters: Vec::new(),
             }
         }
 
@@ -3060,5 +3239,252 @@ vram_mb = 6000
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_backend_type_parses_hf() {
+        let toml = r#"backend = "hf""#;
+        #[derive(serde::Deserialize)]
+        struct Wrap { backend: BackendType }
+        let parsed: Wrap = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.backend, BackendType::Hf);
+    }
+
+    #[test]
+    fn test_dtype_parses_each_variant() {
+        #[derive(serde::Deserialize)]
+        struct Wrap { dtype: Dtype }
+        for (literal, expected) in [
+            (r#"dtype = "bf16""#, Dtype::Bf16),
+            (r#"dtype = "fp16""#, Dtype::Fp16),
+            (r#"dtype = "q4_0""#, Dtype::Q4_0),
+            (r#"dtype = "q4_k_m""#, Dtype::Q4KM),
+            (r#"dtype = "q8_0""#, Dtype::Q8_0),
+        ] {
+            let parsed: Wrap = toml::from_str(literal).unwrap();
+            assert_eq!(parsed.dtype, expected);
+        }
+    }
+
+    #[test]
+    fn test_dtype_rejects_unknown_variant() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Wrap { dtype: Dtype }
+        let toml = r#"dtype = "fp32""#;
+        let err = toml::from_str::<Wrap>(toml).unwrap_err();
+        assert!(err.to_string().contains("fp32"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_adapter_config_parses_minimal_local() {
+        let toml = r#"
+path = "/adapters/my-lora"
+"#;
+        let a: AdapterConfig = toml::from_str(toml).unwrap();
+        assert_eq!(a.path.as_deref(), Some(std::path::Path::new("/adapters/my-lora")));
+        assert_eq!(a.repo, None);
+        assert_eq!(a.revision, None);
+        assert_eq!(a.scale, 1.0);
+    }
+
+    #[test]
+    fn test_adapter_config_parses_hub_with_scale() {
+        let toml = r#"
+repo = "org/my-adapter"
+revision = "v1"
+scale = 0.5
+"#;
+        let a: AdapterConfig = toml::from_str(toml).unwrap();
+        assert_eq!(a.path, None);
+        assert_eq!(a.repo.as_deref(), Some("org/my-adapter"));
+        assert_eq!(a.revision.as_deref(), Some("v1"));
+        assert_eq!(a.scale, 0.5);
+    }
+
+    #[test]
+    fn test_model_config_parses_hf_fields() {
+        let toml = r#"
+id = "m"
+backend = "hf"
+repo = "org/model"
+revision = "main"
+dtype = "bf16"
+hf_token_env = "HF_TOKEN"
+
+[[adapters]]
+path = "/adapters/a"
+
+[[adapters]]
+repo = "org/b"
+scale = 0.3
+"#;
+        let m: ModelConfig = toml::from_str(toml).unwrap();
+        assert_eq!(m.id, "m");
+        assert_eq!(m.backend, BackendType::Hf);
+        assert_eq!(m.repo.as_deref(), Some("org/model"));
+        assert_eq!(m.revision.as_deref(), Some("main"));
+        assert_eq!(m.dtype, Some(Dtype::Bf16));
+        assert_eq!(m.hf_token_env.as_deref(), Some("HF_TOKEN"));
+        assert_eq!(m.adapters.len(), 2);
+        assert_eq!(m.adapters[0].path.as_deref(), Some(std::path::Path::new("/adapters/a")));
+        assert_eq!(m.adapters[1].repo.as_deref(), Some("org/b"));
+        assert_eq!(m.adapters[1].scale, 0.3);
+    }
+
+    #[test]
+    fn test_model_config_hf_fields_default_none_on_non_hf() {
+        let toml = r#"
+id = "m"
+backend = "local"
+path = "/tmp/m.gguf"
+"#;
+        let m: ModelConfig = toml::from_str(toml).unwrap();
+        assert_eq!(m.repo, None);
+        assert_eq!(m.revision, None);
+        assert_eq!(m.dtype, None);
+        assert_eq!(m.hf_token_env, None);
+        assert!(m.adapters.is_empty());
+    }
+
+    #[test]
+    fn test_config_error_variants_exist_for_hf() {
+        // Type-system test: these variants must be constructible with these shapes.
+        let _ = ConfigError::HfBackendNeedsPathOrRepo { id: "m".into() };
+        let _ = ConfigError::HfBackendPathAndRepoExclusive { id: "m".into() };
+        let _ = ConfigError::HfFieldOnNonHfBackend {
+            id: "m".into(),
+            field: "dtype".into(),
+        };
+        let _ = ConfigError::HfAdapterNeedsPathOrRepo {
+            id: "m".into(),
+            index: 0,
+        };
+        let _ = ConfigError::HfAdapterPathAndRepoExclusive {
+            id: "m".into(),
+            index: 0,
+        };
+    }
+
+    fn hf_cfg_with(id: &str, apply: impl FnOnce(&mut ModelConfig)) -> ModelConfig {
+        let mut m = ModelConfig {
+            id: id.into(),
+            backend: BackendType::Hf,
+            path: None,
+            context_size: 4096,
+            gpu_layers: 99,
+            threads: None,
+            batch_size: None,
+            seed: None,
+            api_key: None,
+            base_url: None,
+            upstream_model: None,
+            timeout_secs: None,
+            max_tokens_cap: None,
+            lazy: false,
+            vram_mb: None,
+            pin: false,
+            gpus: Vec::new(),
+            repo: Some("org/model".into()),
+            revision: None,
+            dtype: None,
+            hf_token_env: None,
+            adapters: Vec::new(),
+        };
+        apply(&mut m);
+        m
+    }
+
+    fn config_with_single_model(m: ModelConfig) -> FlarionConfig {
+        FlarionConfig {
+            server: ServerConfig::default(),
+            logging: LoggingConfig::default(),
+            metrics: crate::config::MetricsConfig::default(),
+            models: vec![m],
+            routes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_hf_config_needs_path_or_repo() {
+        let m = hf_cfg_with("m", |m| {
+            m.repo = None;
+            m.path = None;
+        });
+        let err = config_with_single_model(m).validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::HfBackendNeedsPathOrRepo { ref id } if id == "m"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_hf_config_rejects_both_path_and_repo() {
+        let m = hf_cfg_with("m", |m| {
+            m.repo = Some("org/x".into());
+            m.path = Some("/tmp/x".into());
+        });
+        let err = config_with_single_model(m).validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::HfBackendPathAndRepoExclusive { ref id } if id == "m"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_local_backend_rejects_hf_fields() {
+        // Use a real tempfile so ModelPathMissing can't short-circuit — this
+        // exercises reject_hf_fields_on_non_hf() end to end.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut m = local_cfg("m", tmp.path().to_path_buf());
+        m.dtype = Some(Dtype::Bf16);
+        let err = config_with_single_model(m).validate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::HfFieldOnNonHfBackend { ref id, ref field }
+                    if id == "m" && field == "dtype"
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_hf_adapter_needs_path_or_repo() {
+        let m = hf_cfg_with("m", |m| {
+            m.adapters = vec![AdapterConfig {
+                path: None,
+                repo: None,
+                revision: None,
+                scale: 1.0,
+            }];
+        });
+        let err = config_with_single_model(m).validate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::HfAdapterNeedsPathOrRepo { ref id, index: 0 } if id == "m"
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_hf_adapter_rejects_both_path_and_repo() {
+        let m = hf_cfg_with("m", |m| {
+            m.adapters = vec![AdapterConfig {
+                path: Some("/a".into()),
+                repo: Some("org/a".into()),
+                revision: None,
+                scale: 1.0,
+            }];
+        });
+        let err = config_with_single_model(m).validate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::HfAdapterPathAndRepoExclusive { ref id, index: 0 } if id == "m"
+            ),
+            "got: {err:?}"
+        );
     }
 }

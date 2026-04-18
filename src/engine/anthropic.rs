@@ -665,6 +665,11 @@ mod tests {
             vram_mb: None,
             pin: false,
             gpus: vec![],
+            repo: None,
+            revision: None,
+            dtype: None,
+            hf_token_env: None,
+            adapters: Vec::new(),
         };
         let backend = AnthropicBackend::new(&cfg).unwrap();
         assert_eq!(backend.endpoint(), "https://api.anthropic.com/v1/messages");
@@ -690,6 +695,11 @@ mod tests {
             vram_mb: None,
             pin: false,
             gpus: vec![],
+            repo: None,
+            revision: None,
+            dtype: None,
+            hf_token_env: None,
+            adapters: Vec::new(),
         };
         let backend = AnthropicBackend::new(&cfg).unwrap();
         assert_eq!(backend.provider(), "anthropic");

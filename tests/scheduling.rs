@@ -39,6 +39,11 @@ fn local_model(id: &str, path: PathBuf, lazy: bool) -> ModelConfig {
         vram_mb: None,
         pin: false,
         gpus: vec![],
+        repo: None,
+        revision: None,
+        dtype: None,
+        hf_token_env: None,
+        adapters: Vec::new(),
     }
 }
 
@@ -203,6 +208,11 @@ fn overbudget_pinned_config_fails_validation() {
             vram_mb: None,
             pin: true,
             gpus: vec![0],
+            repo: None,
+            revision: None,
+            dtype: None,
+            hf_token_env: None,
+            adapters: Vec::new(),
         }
     }
 
@@ -339,6 +349,11 @@ fn integration_gpu_id_exceeds_declared_device_count_rejected() {
         vram_mb: None,
         pin: false,
         gpus: vec![0],
+        repo: None,
+        revision: None,
+        dtype: None,
+        hf_token_env: None,
+        adapters: Vec::new(),
     }];
     let err = cfg.validate().unwrap_err();
     assert!(

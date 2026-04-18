@@ -564,6 +564,11 @@ mod scripted_adapter_tests {
             vram_mb: None,
             pin: false,
             gpus: vec![],
+            repo: None,
+            revision: None,
+            dtype: None,
+            hf_token_env: None,
+            adapters: Vec::new(),
         }
     }
 

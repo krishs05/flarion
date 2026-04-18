@@ -252,6 +252,29 @@ async fn load_backend(
             backend.load().await?;
             Ok(Arc::new(backend))
         }
+        BackendType::Hf => {
+            #[cfg(feature = "hf_cuda")]
+            {
+                let backend = flarion::engine::hf::HfBackend::new(cfg)
+                    .map_err(|e| anyhow::anyhow!("HF backend init failed for '{}': {e}", cfg.id))?;
+                if !cfg.lazy {
+                    backend.load().await?;
+                } else {
+                    tracing::info!(
+                        model_id = %cfg.id,
+                        "HF model registered as lazy; will load on first request"
+                    );
+                }
+                Ok(Arc::new(backend))
+            }
+            #[cfg(not(feature = "hf_cuda"))]
+            {
+                Err(anyhow::anyhow!(
+                    "model '{}': HF backend requested but binary was built without the `hf_cuda` feature",
+                    cfg.id
+                ))
+            }
+        }
     }
 }
 
@@ -306,6 +329,11 @@ mod tests {
                 vram_mb: None,
                 pin: false,
                 gpus: vec![],
+                repo: None,
+                revision: None,
+                dtype: None,
+                hf_token_env: None,
+                adapters: Vec::new(),
             }],
             ..FlarionConfig::default()
         }
@@ -360,5 +388,95 @@ mod tests {
         let start = std::time::Instant::now();
         backend.shutdown(Duration::from_secs(30)).await;
         assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    #[cfg(feature = "hf_cuda")]
+    #[tokio::test]
+    async fn test_load_backend_hf_lazy_registers_without_loading() {
+        use flarion::engine::scheduling::Scheduler;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let cfg = ModelConfig {
+            id: "hf-test".into(),
+            backend: BackendType::Hf,
+            path: None,
+            context_size: 4096,
+            gpu_layers: 99,
+            threads: None,
+            batch_size: None,
+            seed: None,
+            api_key: None,
+            base_url: None,
+            upstream_model: None,
+            timeout_secs: None,
+            max_tokens_cap: None,
+            lazy: true, // lazy so load() isn't called eagerly
+            vram_mb: None,
+            pin: false,
+            gpus: Vec::new(),
+            repo: Some("org/model".into()),
+            revision: None,
+            dtype: None,
+            hf_token_env: None,
+            adapters: Vec::new(),
+        };
+        let scheduler = Scheduler::new(vec![]);
+        let coord = Arc::new(Mutex::new(()));
+        let backend = load_backend(&cfg, scheduler, coord)
+            .await
+            .expect("lazy load_backend should succeed without invoking load");
+        assert_eq!(backend.model_info().id, "hf-test");
+        assert_eq!(backend.provider(), "hf");
+
+        // Explicitly invoking load returns NotImplemented in Wave 1.
+        let err = backend.load().await.unwrap_err();
+        assert!(
+            matches!(err, flarion::error::EngineError::NotImplemented(_)),
+            "got: {err:?}"
+        );
+    }
+
+    #[cfg(feature = "hf_cuda")]
+    #[tokio::test]
+    async fn test_load_backend_hf_eager_surfaces_not_implemented() {
+        use flarion::engine::scheduling::Scheduler;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let cfg = ModelConfig {
+            id: "hf-eager".into(),
+            backend: BackendType::Hf,
+            path: None,
+            context_size: 4096,
+            gpu_layers: 99,
+            threads: None,
+            batch_size: None,
+            seed: None,
+            api_key: None,
+            base_url: None,
+            upstream_model: None,
+            timeout_secs: None,
+            max_tokens_cap: None,
+            lazy: false, // eager → load() called immediately
+            vram_mb: None,
+            pin: false,
+            gpus: Vec::new(),
+            repo: Some("org/model".into()),
+            revision: None,
+            dtype: None,
+            hf_token_env: None,
+            adapters: Vec::new(),
+        };
+        let scheduler = Scheduler::new(vec![]);
+        let coord = Arc::new(Mutex::new(()));
+        let result = load_backend(&cfg, scheduler, coord).await;
+        assert!(result.is_err(), "expected eager HF load to fail with NotImplemented");
+        let err = result.err().expect("already checked is_err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not implemented") || msg.contains("Wave 2"),
+            "expected NotImplemented surface; got: {msg}"
+        );
     }
 }

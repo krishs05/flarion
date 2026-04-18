@@ -1,5 +1,7 @@
 pub mod anthropic;
 pub mod backend;
+#[cfg(feature = "hf_cuda")]
+pub mod hf;
 pub mod llama;
 pub mod openai;
 pub mod registry;

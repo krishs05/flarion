@@ -42,3 +42,4 @@ tempfile = "3"
 [features]
 default = []
 cuda = ["llama-cpp-2/cuda"]
+hf_cuda = []

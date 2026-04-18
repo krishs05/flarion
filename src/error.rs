@@ -44,6 +44,9 @@ pub enum EngineError {
 
     #[error("backend busy (in-flight request prevents eviction/unload)")]
     BackendBusy,
+
+    #[error("not implemented: {0}")]
+    NotImplemented(String),
 }
 
 pub fn is_retryable(err: &EngineError) -> bool {
@@ -159,6 +162,10 @@ impl From<EngineError> for ApiError {
                     message: "backend busy".into(),
                     retry_after_secs: Some(1),
                 }
+            }
+            EngineError::NotImplemented(detail) => {
+                tracing::error!(detail = %detail, "stub backend method called");
+                ApiError::Internal("internal server error".into())
             }
         }
     }
@@ -441,5 +448,24 @@ mod tests {
         let api_err: ApiError = EngineError::BackendPoisoned.into();
         let resp = api_err.into_response();
         assert!(resp.headers().get(axum::http::header::RETRY_AFTER).is_none());
+    }
+
+    #[test]
+    fn test_not_implemented_maps_to_api_internal() {
+        let engine_err = EngineError::NotImplemented("hf backend wave 1 stub".into());
+        let api_err: ApiError = engine_err.into();
+        assert!(matches!(api_err, ApiError::Internal(_)));
+    }
+
+    #[test]
+    fn test_not_implemented_display_contains_context() {
+        let e = EngineError::NotImplemented("hf.load".into());
+        assert!(e.to_string().contains("not implemented"));
+        assert!(e.to_string().contains("hf.load"));
+    }
+
+    #[test]
+    fn test_not_implemented_is_not_retryable() {
+        assert!(!is_retryable(&EngineError::NotImplemented("x".into())));
     }
 }
