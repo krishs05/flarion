@@ -37,6 +37,7 @@
 - [Building](#building)
 - [GPU Support](#gpu-support)
 - [Migration Guides](#migration-guides)
+- [Roadmap](#roadmap)
 - [License](#license)
 
 ---
@@ -479,6 +480,18 @@ Loopback deployments are unaffected.
   context_size = 4096
   gpu_layers = 99
 ```
+
+## Roadmap
+
+Upcoming features, in rough dependency order. Each is designed and tracked as its own spec; see individual release notes for details as they ship.
+
+- **HF / safetensors backend.** A second first-class local backend built on [Candle](https://github.com/huggingface/candle), serving Hugging Face-native safetensors models without GGUF conversion. Launch coverage: Llama 3.x, Qwen 2.5/3, Mistral, Gemma 2 / 3 / 4-dense, Phi-3 / Phi-4. Supports bf16/fp16 and GGUF-flavor Q4 / Q8 quantization, local paths and HF Hub auto-download, LoRA adapter loading, and tensor-parallel multi-GPU. Runs alongside the llama.cpp backend — both remain first-class.
+- **Prefix / paged KV cache.** Gateway-level LRU of KV cache pages keyed by token-hash, so shared prompt prefixes (system prompts, few-shots, RAG context) skip prefill entirely. Large first-token latency win for workloads with repeated context.
+- **Continuous batching.** Token-interleaved scheduler that packs requests from many concurrent clients into a single decode pass. Targets the throughput gap against vLLM/TGI at concurrency > 4.
+- **Speculative decoding.** Per-model draft/target pairing (`draft_model = "..."`) for 2–3× tokens/sec on most workloads. Rust's low-latency verify-and-accept loop is a genuine advantage here.
+- **Finetuning.** In-process LoRA finetuning on the HF backend, single- and multi-GPU. Trained adapters load directly into the inference path — same binary, same weights, closed dev loop.
+
+Positioning stays the same: single binary, every model, production observability. New features extend that surface; they don't fork it.
 
 ## License
 
