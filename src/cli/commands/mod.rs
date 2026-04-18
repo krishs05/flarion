@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+pub mod endpoints;
+pub mod login;
 pub mod serve;
 pub mod status;
 
@@ -33,6 +35,10 @@ pub enum Command {
     Serve(crate::config::Cli),
     /// Inspect a running Flarion server.
     Status(crate::cli::commands::status::StatusArgs),
+    /// Manage named endpoints in the client config.
+    Endpoints(crate::cli::commands::endpoints::EndpointsArgs),
+    /// Interactive first-run wizard to add an endpoint.
+    Login { name: String },
 }
 
 pub async fn dispatch() -> anyhow::Result<()> {
@@ -40,6 +46,8 @@ pub async fn dispatch() -> anyhow::Result<()> {
     match parsed.command {
         Some(Command::Serve(args)) => serve::run(args).await,
         Some(Command::Status(args)) => status::run(args).await,
+        Some(Command::Endpoints(args)) => endpoints::run(args).await,
+        Some(Command::Login { name }) => login::run(name).await,
         None => {
             // Compat: `flarion -c foo.toml` with no subcommand → act like serve.
             if parsed.legacy_config.is_some() {
