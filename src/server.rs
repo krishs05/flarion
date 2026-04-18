@@ -10,9 +10,22 @@ use tower_http::cors::CorsLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::admin::admin_router;
 use crate::auth::{AuthState, auth_middleware};
 use crate::config::{MetricsConfig, ServerConfig};
 use crate::engine::registry::BackendRegistry;
+
+#[derive(Clone)]
+pub struct ApiState {
+    pub registry: Arc<BackendRegistry>,
+    pub admin: Option<Arc<crate::admin::state::AdminState>>,
+}
+
+impl axum::extract::FromRef<ApiState> for Arc<BackendRegistry> {
+    fn from_ref(input: &ApiState) -> Self {
+        input.registry.clone()
+    }
+}
 
 /// Maximum accepted JSON request body, in bytes. Chat completions shouldn't
 /// legitimately exceed this; large system prompts + context can reach a few
@@ -41,16 +54,17 @@ fn build_cors_layer(server: &ServerConfig) -> CorsLayer {
     CorsLayer::new()
 }
 
-pub fn create_router(
-    registry: Arc<BackendRegistry>,
-    server_cfg: &ServerConfig,
+/// Build the API sub-router with state already resolved to `Router<()>`.
+///
+/// Mounts `/health`, `/v1/models`, `/v1/chat/completions`, and — when
+/// `metrics_cfg` says so — the metrics endpoint on the main listener.
+/// Returning `Router<()>` lets callers merge additional routers (e.g. admin)
+/// before adding shared middleware layers.
+fn api_sub_router(
+    state: ApiState,
     metrics_cfg: &MetricsConfig,
     metrics_handle: Option<Arc<PrometheusHandle>>,
 ) -> Router {
-    let auth_state = AuthState {
-        api_keys: Arc::new(server_cfg.api_keys.clone()),
-    };
-
     let mut app = Router::new()
         .route("/health", get(crate::api::health::health_check))
         .route("/v1/models", get(crate::api::models::list_models))
@@ -71,6 +85,48 @@ pub fn create_router(
         );
     }
 
+    app.with_state(state)
+}
+
+pub fn create_router(
+    registry: Arc<BackendRegistry>,
+    server_cfg: &ServerConfig,
+    metrics_cfg: &MetricsConfig,
+    metrics_handle: Option<Arc<PrometheusHandle>>,
+) -> Router {
+    let auth_state = AuthState {
+        api_keys: Arc::new(server_cfg.api_keys.clone()),
+    };
+
+    let state = ApiState { registry, admin: None };
+    api_sub_router(state, metrics_cfg, metrics_handle)
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .layer(from_fn_with_state(auth_state, auth_middleware))
+        .layer(TraceLayer::new_for_http())
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(300),
+        ))
+        .layer(build_cors_layer(server_cfg))
+}
+
+pub fn create_router_with_admin(
+    registry: Arc<BackendRegistry>,
+    admin_state: Arc<crate::admin::state::AdminState>,
+    server_cfg: &ServerConfig,
+    metrics_cfg: &MetricsConfig,
+    metrics_handle: Option<Arc<PrometheusHandle>>,
+) -> Router {
+    let auth_state = AuthState {
+        api_keys: Arc::new(server_cfg.api_keys.clone()),
+    };
+
+    let state = ApiState { registry, admin: Some(admin_state.clone()) };
+    // Merge the admin router into the already-state-resolved API sub-router,
+    // producing a single `Router<()>` before shared middleware is applied.
+    let app = api_sub_router(state, metrics_cfg, metrics_handle)
+        .merge(admin_router(admin_state));
+
     app.layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(from_fn_with_state(auth_state, auth_middleware))
         .layer(TraceLayer::new_for_http())
@@ -79,7 +135,6 @@ pub fn create_router(
             Duration::from_secs(300),
         ))
         .layer(build_cors_layer(server_cfg))
-        .with_state(registry)
 }
 
 #[cfg(test)]

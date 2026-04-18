@@ -48,6 +48,14 @@ pub trait InferenceBackend: Send + Sync {
         Ok(())
     }
 
+    /// Set or clear the session pin for this backend. Default no-op is correct
+    /// for cloud/remote backends (nothing to pin); local backends can override
+    /// to flip a runtime `AtomicBool` that `LoadCoordinator` checks before
+    /// evicting.
+    async fn pin(&self, _pinned: bool) -> Result<(), EngineError> {
+        Ok(())
+    }
+
     /// Install a weak handle to the eviction orchestrator. Called after
     /// the registry is built (late-bind to break the Registry↔backend
     /// cycle). Default no-op for backends that don't drive eviction

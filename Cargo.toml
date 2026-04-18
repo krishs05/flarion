@@ -16,7 +16,7 @@ toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors", "timeout", "trace"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
@@ -33,11 +33,14 @@ metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
 url = "2"
 nvml-wrapper = "0.10"
+dashmap = "6"
+dirs = "5"
 
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+wiremock = "0.6"
 
 [features]
 default = []
