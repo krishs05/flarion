@@ -15,6 +15,18 @@ use crate::auth::{AuthState, auth_middleware};
 use crate::config::{MetricsConfig, ServerConfig};
 use crate::engine::registry::BackendRegistry;
 
+#[derive(Clone)]
+pub struct ApiState {
+    pub registry: Arc<BackendRegistry>,
+    pub admin: Option<Arc<crate::admin::state::AdminState>>,
+}
+
+impl axum::extract::FromRef<ApiState> for Arc<BackendRegistry> {
+    fn from_ref(input: &ApiState) -> Self {
+        input.registry.clone()
+    }
+}
+
 /// Maximum accepted JSON request body, in bytes. Chat completions shouldn't
 /// legitimately exceed this; large system prompts + context can reach a few
 /// hundred KB but 1 MiB is a comfortable ceiling that blocks obvious abuse.
@@ -49,7 +61,7 @@ fn build_cors_layer(server: &ServerConfig) -> CorsLayer {
 /// Returning `Router<()>` lets callers merge additional routers (e.g. admin)
 /// before adding shared middleware layers.
 fn api_sub_router(
-    registry: Arc<BackendRegistry>,
+    state: ApiState,
     metrics_cfg: &MetricsConfig,
     metrics_handle: Option<Arc<PrometheusHandle>>,
 ) -> Router {
@@ -73,7 +85,7 @@ fn api_sub_router(
         );
     }
 
-    app.with_state(registry)
+    app.with_state(state)
 }
 
 pub fn create_router(
@@ -86,7 +98,8 @@ pub fn create_router(
         api_keys: Arc::new(server_cfg.api_keys.clone()),
     };
 
-    api_sub_router(registry, metrics_cfg, metrics_handle)
+    let state = ApiState { registry, admin: None };
+    api_sub_router(state, metrics_cfg, metrics_handle)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(from_fn_with_state(auth_state, auth_middleware))
         .layer(TraceLayer::new_for_http())
@@ -108,9 +121,10 @@ pub fn create_router_with_admin(
         api_keys: Arc::new(server_cfg.api_keys.clone()),
     };
 
+    let state = ApiState { registry, admin: Some(admin_state.clone()) };
     // Merge the admin router into the already-state-resolved API sub-router,
     // producing a single `Router<()>` before shared middleware is applied.
-    let app = api_sub_router(registry, metrics_cfg, metrics_handle)
+    let app = api_sub_router(state, metrics_cfg, metrics_handle)
         .merge(admin_router(admin_state));
 
     app.layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))

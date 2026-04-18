@@ -10,7 +10,6 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::api::types::{ChatCompletionChunk, ChatCompletionRequest};
-use crate::engine::registry::BackendRegistry;
 use crate::error::ApiError;
 
 /// Hard ceiling for `messages.len()`. The 1 MiB body limit already bounds
@@ -22,12 +21,39 @@ use crate::metrics::{COMPLETION_TOKENS, PROMPT_TOKENS, REQUEST_DURATION_SECONDS,
 use crate::routing::matchers::estimate_prompt_tokens;
 use crate::routing::trace::{REQUEST_HEADERS, RouteTrace, with_trace};
 
+/// RAII guard that decrements the in-flight counter when dropped (armed).
+/// Used only for the non-streaming path; the guard stays armed so Drop
+/// always fires the decrement, even on panic.
+struct InFlightGuard {
+    admin: Arc<crate::admin::state::AdminState>,
+    model_id: String,
+    armed: bool,
+}
+
+impl InFlightGuard {
+    fn new(admin: Arc<crate::admin::state::AdminState>, model_id: String) -> Self {
+        admin.tracker.in_flight_inc(&model_id);
+        Self { admin, model_id, armed: true }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.admin.tracker.in_flight_dec(&self.model_id);
+        }
+    }
+}
+
 pub async fn chat_completions(
-    State(registry): State<Arc<BackendRegistry>>,
+    State(state): State<crate::server::ApiState>,
     headers: HeaderMap,
     Json(mut request): Json<ChatCompletionRequest>,
 ) -> Result<axum::response::Response, ApiError> {
     let start = Instant::now();
+    let registry = state.registry.clone();
+    let admin = state.admin.clone();
+
     let backend = registry
         .get(&request.model)
         .ok_or_else(|| ApiError::ModelNotFound {
@@ -53,14 +79,24 @@ pub async fn chat_completions(
     }
 
     let prompt_tokens = estimate_prompt_tokens(&request) as f64;
-    let model_id_for_direct = request.model.clone();
+    let model_id = request.model.clone();
     let is_stream = request.stream;
+
+    let req_id = format!("req_{}", uuid::Uuid::new_v4().simple());
 
     if is_stream {
         // Streaming: response headers are flushed before the first chunk, so
         // the X-Flarion-* trace headers cannot be populated — routing trace
         // is only surfaced via server logs and metrics emitted by
         // RoutedBackend.
+
+        if let Some(admin) = admin.as_ref() {
+            admin.tracker.in_flight_inc(&model_id);
+        }
+        // TODO(Task 3b): emit Started here and Completed/Failed/Canceled inside
+        //   done_stream, with matching in_flight_dec. Reuse the existing
+        //   `saw_finish` atomic and `err_rx` oneshot to classify status.
+
         let (tx, rx) = tokio::sync::mpsc::channel::<ChatCompletionChunk>(256);
         let backend_clone = backend.clone();
         let request_clone = request.clone();
@@ -157,6 +193,18 @@ pub async fn chat_completions(
             .keep_alive(KeepAlive::default())
             .into_response())
     } else {
+        // Non-streaming: full instrumentation with InFlightGuard + lifecycle events.
+        let guard = admin.as_ref().map(|a| InFlightGuard::new(a.clone(), model_id.clone()));
+
+        if let Some(admin) = admin.as_ref() {
+            admin.tracker.record(crate::admin::types::RequestEvent::Started {
+                id: req_id.clone(),
+                ts: chrono::Utc::now().to_rfc3339(),
+                route: None,
+                backend: model_id.clone(),
+            }).await;
+        }
+
         let header_map = headers_to_map(&headers);
         let (result, trace) = with_trace(async move {
             REQUEST_HEADERS
@@ -171,7 +219,7 @@ pub async fn chat_completions(
         let elapsed = start.elapsed().as_secs_f64();
         let (route_label, backend_label) = match (&trace.route_id, &trace.backend_id) {
             (Some(r), Some(b)) => (r.clone(), b.clone()),
-            _ => ("direct".to_string(), model_id_for_direct.clone()),
+            _ => ("direct".to_string(), model_id.clone()),
         };
 
         metrics::histogram!(
@@ -186,6 +234,38 @@ pub async fn chat_completions(
             "backend" => backend_label.clone(),
         )
         .record(prompt_tokens);
+
+        // Emit terminal lifecycle event; guard drops at function return and
+        // decrements the in-flight counter exactly once.
+        if let Some(admin) = admin.as_ref() {
+            let duration_ms = start.elapsed().as_millis() as u64;
+            let event = match &result {
+                Ok(resp) => crate::admin::types::RequestEvent::Completed {
+                    id: req_id.clone(),
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    route: trace.route_id.clone(),
+                    matched_rule: trace.rule.clone(),
+                    backend: trace.backend_id.clone().unwrap_or_else(|| model_id.clone()),
+                    fallback_count: trace.fallback_count,
+                    status: "ok".into(),
+                    ttft_ms: None,
+                    duration_ms,
+                    prompt_tokens: resp.usage.prompt_tokens as u64,
+                    completion_tokens: resp.usage.completion_tokens as u64,
+                },
+                Err(e) => crate::admin::types::RequestEvent::Failed {
+                    id: req_id.clone(),
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    backend: trace.backend_id.clone().unwrap_or_else(|| model_id.clone()),
+                    reason: e.to_string(),
+                    duration_ms,
+                },
+            };
+            admin.tracker.record(event).await;
+        }
+
+        // guard drops here, decrementing in-flight counter
+        drop(guard);
 
         match result {
             Ok(response) => {
@@ -204,7 +284,7 @@ pub async fn chat_completions(
                 .increment(1);
 
                 let mut response_headers = HeaderMap::new();
-                insert_trace_headers(&mut response_headers, &trace, &model_id_for_direct);
+                insert_trace_headers(&mut response_headers, &trace, &model_id);
                 Ok((response_headers, Json(response)).into_response())
             }
             Err(err) => {
@@ -256,5 +336,66 @@ fn insert_trace_headers(out: &mut HeaderMap, trace: &RouteTrace, direct_id: &str
             "x-flarion-fallback-count",
             HeaderValue::from(trace.fallback_count),
         );
+    }
+}
+
+#[cfg(test)]
+mod admin_emission_tests {
+    use super::*;
+    use crate::admin::state::AdminState;
+    use crate::api::types::{ChatCompletionRequest, ChatMessage};
+    use crate::engine::registry::BackendRegistry;
+    use crate::engine::testing::MockBackend;
+    use axum::extract::State;
+
+    fn mk_request(model: &str, stream: bool) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.into(),
+            messages: vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            stream,
+            temperature: 0.7,
+            top_p: 0.9,
+            max_tokens: 32,
+            stop: vec![],
+            seed: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn non_streaming_emits_started_and_completed() {
+        let mut reg = BackendRegistry::new();
+        reg.insert("m".into(), Arc::new(MockBackend::succeeding("m", "hello")));
+        let registry = Arc::new(reg);
+        let admin = Arc::new(AdminState::new(registry.clone(), "127.0.0.1:0".into(), 100));
+
+        let state = crate::server::ApiState {
+            registry: registry.clone(),
+            admin: Some(admin.clone()),
+        };
+        let _resp = chat_completions(
+            State(state),
+            HeaderMap::new(),
+            Json(mk_request("m", false)),
+        ).await.unwrap();
+
+        let events = admin.tracker.tail(10).await;
+        assert_eq!(events.len(), 2, "expected Started + Completed, got {} events", events.len());
+        assert!(matches!(events[0], crate::admin::types::RequestEvent::Started { .. }));
+        assert!(matches!(events[1], crate::admin::types::RequestEvent::Completed { .. }));
+        assert_eq!(admin.tracker.in_flight("m"), 0, "counter must be balanced");
+    }
+
+    #[tokio::test]
+    async fn non_streaming_without_admin_is_silent() {
+        let mut reg = BackendRegistry::new();
+        reg.insert("m".into(), Arc::new(MockBackend::succeeding("m", "hello")));
+        let registry = Arc::new(reg);
+        let state = crate::server::ApiState { registry, admin: None };
+        let _resp = chat_completions(
+            State(state),
+            HeaderMap::new(),
+            Json(mk_request("m", false)),
+        ).await.unwrap();
+        // No panic, handler returns Ok — assertion is behavioral absence of effects.
     }
 }
