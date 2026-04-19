@@ -64,3 +64,15 @@ fn flarion_status_help_listed() {
         "--help should list 'status' subcommand: {stdout}"
     );
 }
+
+#[test]
+fn flarion_completions_bash_emits_script() {
+    let bin = env!("CARGO_BIN_EXE_flarion");
+    let out = std::process::Command::new(bin)
+        .args(["completions", "bash"])
+        .output().unwrap();
+    assert!(out.status.success(), "exit: {:?} stderr: {}", out.status, String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("_flarion") || stdout.contains("flarion"),
+        "expected bash completion content: {stdout}");
+}

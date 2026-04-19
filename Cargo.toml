@@ -39,6 +39,7 @@ rustyline = "14"
 resvg = "0.47.0"
 tiny-skia = "0.12.0"
 fontdb = "0.23.0"
+clap_complete = "4.6.2"
 
 [dev-dependencies]
 http-body-util = "0.1"

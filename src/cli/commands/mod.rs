@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 pub mod chat;
+pub mod completions;
 pub mod config;
 pub mod endpoints;
 pub mod gpu;
@@ -43,6 +44,8 @@ pub enum Command {
     Serve(crate::config::Cli),
     /// Send a chat completion or start an interactive REPL.
     Chat(crate::cli::commands::chat::ChatArgs),
+    /// Generate shell completion scripts.
+    Completions(crate::cli::commands::completions::CompletionsArgs),
     /// Show GPU status.
     Gpu(crate::cli::commands::gpu::GpuArgs),
     /// Liveness check — hits /health.
@@ -70,6 +73,7 @@ pub async fn dispatch() -> anyhow::Result<()> {
     match parsed.command {
         Some(Command::Serve(args)) => serve::run(args).await,
         Some(Command::Chat(args)) => chat::run(args).await,
+        Some(Command::Completions(args)) => completions::run(args).await,
         Some(Command::Gpu(args)) => gpu::run(args).await,
         Some(Command::Health(args)) => health::run(args).await,
         Some(Command::Status(args)) => status::run(args).await,
