@@ -15,8 +15,15 @@ pub struct HealthArgs {
     pub client_config: Option<PathBuf>,
 }
 
+impl crate::cli::resolve::EndpointArgs for HealthArgs {
+    fn url(&self) -> Option<&str> { self.url.as_deref() }
+    fn api_key(&self) -> Option<&str> { self.api_key.as_deref() }
+    fn endpoint(&self) -> Option<&str> { self.endpoint.as_deref() }
+    fn client_config(&self) -> Option<&std::path::Path> { self.client_config.as_deref() }
+}
+
 pub async fn run(args: HealthArgs) -> anyhow::Result<()> {
-    let endpoint = resolve_endpoint(&args)?;
+    let endpoint = crate::cli::resolve::resolve_from_args(&args)?;
     let client = crate::cli::client::FlarionClient::new(endpoint)?;
     let started = std::time::Instant::now();
     match client.health().await {
@@ -52,23 +59,3 @@ pub async fn run(args: HealthArgs) -> anyhow::Result<()> {
     }
 }
 
-fn resolve_endpoint(args: &HealthArgs) -> anyhow::Result<crate::cli::endpoint::Endpoint> {
-    use crate::cli::{endpoint_file, resolve::{resolve, ResolveArgs}};
-
-    let file = if let Some(p) = &args.client_config {
-        Some(endpoint_file::load(p)?)
-    } else if let Some(p) = endpoint_file::default_path() {
-        endpoint_file::load(&p).ok()
-    } else {
-        None
-    };
-
-    Ok(resolve(
-        &ResolveArgs {
-            url_flag: args.url.clone(),
-            api_key_flag: args.api_key.clone(),
-            endpoint_name: args.endpoint.clone(),
-        },
-        file.as_ref(),
-    )?)
-}

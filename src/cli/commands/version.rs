@@ -76,6 +76,13 @@ pub async fn run(args: VersionArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+impl crate::cli::resolve::EndpointArgs for VersionArgs {
+    fn url(&self) -> Option<&str> { self.url.as_deref() }
+    fn api_key(&self) -> Option<&str> { self.api_key.as_deref() }
+    fn endpoint(&self) -> Option<&str> { self.endpoint.as_deref() }
+    fn client_config(&self) -> Option<&std::path::Path> { self.client_config.as_deref() }
+}
+
 struct ServerInfo {
     version: String,
     endpoint_name: String,
@@ -84,29 +91,9 @@ struct ServerInfo {
 }
 
 async fn try_fetch_server(args: &VersionArgs) -> anyhow::Result<ServerInfo> {
-    use crate::cli::{
-        client::FlarionClient,
-        endpoint_file,
-        resolve::{resolve, ResolveArgs},
-    };
+    use crate::cli::client::FlarionClient;
 
-    let file = if let Some(p) = &args.client_config {
-        Some(endpoint_file::load(p)?)
-    } else if let Some(p) = endpoint_file::default_path() {
-        endpoint_file::load(&p).ok()
-    } else {
-        None
-    };
-
-    let endpoint = resolve(
-        &ResolveArgs {
-            url_flag: args.url.clone(),
-            api_key_flag: args.api_key.clone(),
-            endpoint_name: args.endpoint.clone(),
-        },
-        file.as_ref(),
-    )?;
-
+    let endpoint = crate::cli::resolve::resolve_from_args(args)?;
     let client = FlarionClient::new(endpoint.clone())?;
     let v = client.version().await?;
     Ok(ServerInfo {
