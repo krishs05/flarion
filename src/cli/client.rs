@@ -100,6 +100,53 @@ impl FlarionClient {
         self.get(&format!("/v1/admin/requests?tail={tail}")).await
     }
 
+    pub async fn stream_requests(
+        &self,
+    ) -> Result<
+        impl futures_util::Stream<Item = Result<crate::admin::types::RequestEvent, ClientError>>,
+        ClientError,
+    > {
+        use eventsource_stream::Eventsource;
+        use futures_util::StreamExt;
+
+        let url = format!(
+            "{}/v1/admin/requests/stream",
+            self.endpoint.url.trim_end_matches('/')
+        );
+        let mut req = self.http.get(&url);
+        if let Some(k) = &self.endpoint.api_key {
+            req = req.bearer_auth(k);
+        }
+        // SSE streams may idle; no timeout here.
+        let req = req.timeout(std::time::Duration::from_secs(60 * 60 * 24));
+        let resp = req.send().await.map_err(|e| ClientError::Unreachable {
+            url: url.clone(),
+            source: e,
+        })?;
+        if !resp.status().is_success() {
+            return Err(match resp.status() {
+                reqwest::StatusCode::UNAUTHORIZED => ClientError::Unauthorized,
+                s => ClientError::Server {
+                    status: s.as_u16(),
+                    body: String::new(),
+                },
+            });
+        }
+        let byte_stream = resp
+            .bytes_stream()
+            .map(|r| r.map_err(std::io::Error::other));
+        let event_stream = byte_stream.eventsource();
+        Ok(event_stream.map(|r| match r {
+            Ok(ev) => serde_json::from_str::<crate::admin::types::RequestEvent>(&ev.data)
+                .map_err(|e| ClientError::Decode {
+                    reason: e.to_string(),
+                }),
+            Err(e) => Err(ClientError::Stream {
+                reason: e.to_string(),
+            }),
+        }))
+    }
+
     pub async fn effective_config(&self) -> Result<serde_json::Value, ClientError> {
         self.get("/v1/admin/config").await
     }
