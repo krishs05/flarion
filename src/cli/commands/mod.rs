@@ -6,6 +6,7 @@ pub mod gpu;
 pub mod health;
 pub mod login;
 pub mod models;
+pub mod routes;
 pub mod serve;
 pub mod status;
 pub mod version;
@@ -45,6 +46,8 @@ pub enum Command {
     Status(crate::cli::commands::status::StatusArgs),
     /// Manage models (list, show, load, unload, pin, unpin).
     Models(crate::cli::commands::models::ModelsArgs),
+    /// Inspect configured routes.
+    Routes(crate::cli::commands::routes::RoutesArgs),
     /// Manage named endpoints in the client config.
     Endpoints(crate::cli::commands::endpoints::EndpointsArgs),
     /// Interactive first-run wizard to add an endpoint.
@@ -61,6 +64,7 @@ pub async fn dispatch() -> anyhow::Result<()> {
         Some(Command::Health(args)) => health::run(args).await,
         Some(Command::Status(args)) => status::run(args).await,
         Some(Command::Models(args)) => models::run(args).await,
+        Some(Command::Routes(args)) => routes::run(args).await,
         Some(Command::Endpoints(args)) => endpoints::run(args).await,
         Some(Command::Login { name }) => login::run(name).await,
         Some(Command::Version(args)) => version::run(args).await,
