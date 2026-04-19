@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 pub mod endpoints;
+pub mod health;
 pub mod login;
 pub mod serve;
 pub mod status;
@@ -34,6 +35,8 @@ pub struct FlarionCli {
 pub enum Command {
     /// Run the Flarion inference gateway server.
     Serve(crate::config::Cli),
+    /// Liveness check — hits /health.
+    Health(crate::cli::commands::health::HealthArgs),
     /// Inspect a running Flarion server.
     Status(crate::cli::commands::status::StatusArgs),
     /// Manage named endpoints in the client config.
@@ -48,6 +51,7 @@ pub async fn dispatch() -> anyhow::Result<()> {
     let parsed = FlarionCli::parse();
     match parsed.command {
         Some(Command::Serve(args)) => serve::run(args).await,
+        Some(Command::Health(args)) => health::run(args).await,
         Some(Command::Status(args)) => status::run(args).await,
         Some(Command::Endpoints(args)) => endpoints::run(args).await,
         Some(Command::Login { name }) => login::run(name).await,
