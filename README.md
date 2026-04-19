@@ -205,27 +205,74 @@ first_token_timeout_ms = 5000
 
 ## CLI
 
-Beyond serving, the `flarion` binary exposes subcommands for inspecting a running server.
+The `flarion` binary is both the server and a first-class client for inspecting and controlling a running server.
 
-Register an endpoint:
+### Setup
 
 ```bash
-flarion endpoints add home --url http://127.0.0.1:8080
-# or, interactive:
+# Save a named endpoint (interactive wizard, or --url directly)
 flarion login home
+# or:
+flarion endpoints add home --url http://127.0.0.1:8080
+flarion endpoints list
 ```
 
-Inspect server state:
+Endpoints persist in `~/.config/flarion/config.toml` (Unix) or `%APPDATA%\flarion\config.toml` (Windows). Secrets can come from env vars (`api_key = "${MY_KEY}"`) or a shell command (`api_key_cmd = "op read op://vault/flarion/key"`).
+
+### Inspect
 
 ```bash
-flarion status                       # human-readable: version, GPUs, models, 60s rollup
-flarion status --json | jq           # pipeable JSON for scripting
-flarion endpoints test               # ping + version + latency for every saved endpoint
+flarion status                     # human-readable snapshot
+flarion status --watch             # refresh every 1s
+flarion status --json | jq         # pipeable JSON
+flarion gpu                        # all GPUs
+flarion models list --loaded       # filter
+flarion models show gemma-4-e2b    # detail view
+flarion routes list
+flarion requests tail -n 100 --follow   # live SSE stream
+flarion config show                # effective server config, redacted
+flarion version                    # client + server + features
 ```
 
-Endpoints persist in `~/.config/flarion/config.toml` (Unix) or `%APPDATA%\flarion\config.toml` (Windows). Each can be named — handy for switching between a local dev server and a remote GPU host. Secrets can come from env vars (`api_key = "${MY_KEY}"`) or a shell command (`api_key_cmd = "op read op://vault/flarion/key"`).
+### Mutate
 
-A full TUI dashboard and `flarion chat` arrive in a follow-up phase. This phase ships the admin API (`/v1/admin/*`) and the scripting surface that sits on top of it.
+```bash
+flarion models load gemma-4-e2b
+flarion models pin gemma-4-e2b
+flarion models unload gemma-4-e2b --yes
+```
+
+### Chat
+
+```bash
+# One-shot, streams tokens as they arrive when stdout is a TTY
+flarion chat "summarize transformers in one sentence" --model gemma-4-e2b
+
+# Interactive REPL with arrow-key history and slash commands
+flarion chat --repl --model gemma-4-e2b
+# /exit · /clear · /model <id> · /help
+
+# Pipe-friendly (forces non-streaming)
+echo "how tall is Mt Everest?" | flarion chat - --model gemma-4-e2b --no-stream
+```
+
+### Scripting
+
+All read commands accept `--json` with a deterministic schema. Exit codes:
+`0` success, `1` generic, `2` unauthorized, `3` server unreachable, `4` not found, `5` conflict (busy / already-loaded).
+
+### Shell completions
+
+```bash
+# bash
+flarion completions bash > ~/.local/share/bash-completion/completions/flarion
+# zsh
+flarion completions zsh > ~/.zfunc/_flarion
+# powershell
+flarion completions powershell | Out-String | Invoke-Expression
+```
+
+See [CHANGELOG.md](CHANGELOG.md) for the full 0.11.0 changelog.
 
 ## Dashboard UI
 

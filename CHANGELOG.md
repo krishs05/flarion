@@ -2,6 +2,40 @@
 
 All notable changes to Flarion. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow SemVer-ish pre-1.0 rules (minor = feature add, patch = fix).
 
+## 0.11.0 — 2026-04-19
+
+Completes the headless CLI surface and adds the branded splash banner and chat subcommand. No breaking changes from 0.10.0.
+
+### Added
+
+- **`flarion version`** — client + server version info with a branded splash banner rasterized from `assets/flarion-mark.svg` via `resvg` + unicode half-blocks. Gracefully falls back to an ASCII fallback (committed alongside the SVG) under `NO_COLOR`, `FLARION_ASCII=1`, or non-TTY stdout.
+- **`flarion health`** — `/health` probe with latency.
+- **`flarion gpu [<id>]`** — per-GPU inspection with optional id filter.
+- **`flarion models list|show|load|unload|pin|unpin`** — full model-lifecycle surface, with confirmation prompts on destructive operations (skippable via `--yes`).
+- **`flarion routes list|show`** — route configuration + hit counts.
+- **`flarion requests tail [-n N] [--follow]`** — request log with optional SSE live streaming.
+- **`flarion config show [--raw]`** and **`flarion config validate [-c path]`** — server-effective config (redacted by default) and local-file validation.
+- **`flarion status --watch`** — 1 Hz refresh-in-place loop, Ctrl+C to exit.
+- **`flarion chat "prompt"`** — one-shot chat, streams by default when stdout is a TTY (`--no-stream` to disable). Reads prompt from stdin with `-`.
+- **`flarion chat --repl`** — interactive REPL with arrow-key history (persisted to `$XDG_DATA_HOME/flarion/chat_history` on Unix, `%LOCALAPPDATA%\flarion\chat_history` on Windows), slash commands (`/exit`, `/clear`, `/model <id>`, `/help`), and mid-stream Ctrl+C cancel.
+- **`flarion completions <bash|zsh|fish|powershell>`** — shell completion script generator.
+
+### Changed
+
+- Endpoint resolution consolidated behind an `EndpointArgs` trait in `src/cli/resolve.rs` — no more per-command boilerplate.
+
+### Internal
+
+- New deps: `rustyline` (REPL input), `resvg` + `tiny-skia` + `fontdb` (SVG rasterization), `clap_complete` (shell completions).
+- New client methods: `FlarionClient::chat_nonstream`, `chat_stream`, `stream_requests`.
+- Baseline tests 400 → 417.
+
+### Deferred (Phase 3)
+
+- Full TUI dashboard (ratatui with tabs, command palette, live request log view).
+- Dynamic value completion (model IDs in `flarion models unload <TAB>`).
+- Light theme.
+
 ## 0.10.0 — 2026-04-18
 
 First-class observability and control surface on top of Flarion's inference gateway.
