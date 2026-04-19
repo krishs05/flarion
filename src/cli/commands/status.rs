@@ -16,6 +16,9 @@ pub struct StatusArgs {
     pub json: bool,
     #[arg(long)]
     pub client_config: Option<PathBuf>,
+    /// Refresh in place at 1 Hz. Ctrl+C to exit.
+    #[arg(long)]
+    pub watch: bool,
 }
 
 impl crate::cli::resolve::EndpointArgs for StatusArgs {
@@ -26,6 +29,9 @@ impl crate::cli::resolve::EndpointArgs for StatusArgs {
 }
 
 pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
+    if args.watch {
+        return run_watch(args).await;
+    }
     let endpoint = crate::cli::resolve::resolve_from_args(&args)?;
 
     let client = FlarionClient::new(endpoint.clone())?;
@@ -51,6 +57,37 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
         print!("{}", render_human(&status));
     }
     Ok(())
+}
+
+async fn run_watch(args: StatusArgs) -> anyhow::Result<()> {
+    // JSON + watch doesn't make sense — watch mode is TUI-like.
+    if args.json {
+        anyhow::bail!("--watch is incompatible with --json");
+    }
+
+    let endpoint = crate::cli::resolve::resolve_from_args(&args)?;
+    let client = crate::cli::client::FlarionClient::new(endpoint)?;
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                // clear screen + reset cursor, newline, done
+                print!("\x1b[2J\x1b[H");
+                println!("(watch stopped)");
+                return Ok(());
+            }
+            _ = ticker.tick() => {
+                let output = match client.status().await {
+                    Ok(s) => render_human(&s),
+                    Err(e) => format!("(error: {e})\n(retrying on next tick…)\n"),
+                };
+                print!("\x1b[2J\x1b[H{output}");
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+        }
+    }
 }
 
 fn render_human(s: &Status) -> String {
