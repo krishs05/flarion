@@ -60,6 +60,33 @@ pub fn resolve(args: &ResolveArgs, file: Option<&EndpointFile>) -> Result<Endpoi
     })
 }
 
+/// Trait any command's args can implement to expose endpoint-related fields.
+/// `resolve_from_args` uses it to share resolution boilerplate across subcommands.
+pub trait EndpointArgs {
+    fn url(&self) -> Option<&str>;
+    fn api_key(&self) -> Option<&str>;
+    fn endpoint(&self) -> Option<&str>;
+    fn client_config(&self) -> Option<&std::path::Path>;
+}
+
+/// Load the client config (if any) and resolve the endpoint per the existing
+/// precedence (flags > env > named > default > local flarion.toml > loopback).
+pub fn resolve_from_args(args: &impl EndpointArgs) -> Result<crate::cli::endpoint::Endpoint, anyhow::Error> {
+    use crate::cli::endpoint_file;
+
+    let file = if let Some(p) = args.client_config() {
+        Some(endpoint_file::load(p)?)
+    } else if let Some(p) = endpoint_file::default_path() {
+        endpoint_file::load(&p).ok()
+    } else { None };
+
+    resolve(&ResolveArgs {
+        url_flag: args.url().map(String::from),
+        api_key_flag: args.api_key().map(String::from),
+        endpoint_name: args.endpoint().map(String::from),
+    }, file.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

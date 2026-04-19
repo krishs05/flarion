@@ -100,6 +100,53 @@ impl FlarionClient {
         self.get(&format!("/v1/admin/requests?tail={tail}")).await
     }
 
+    pub async fn stream_requests(
+        &self,
+    ) -> Result<
+        impl futures_util::Stream<Item = Result<crate::admin::types::RequestEvent, ClientError>>,
+        ClientError,
+    > {
+        use eventsource_stream::Eventsource;
+        use futures_util::StreamExt;
+
+        let url = format!(
+            "{}/v1/admin/requests/stream",
+            self.endpoint.url.trim_end_matches('/')
+        );
+        let mut req = self.http.get(&url);
+        if let Some(k) = &self.endpoint.api_key {
+            req = req.bearer_auth(k);
+        }
+        // SSE streams may idle; no timeout here.
+        let req = req.timeout(std::time::Duration::from_secs(60 * 60 * 24));
+        let resp = req.send().await.map_err(|e| ClientError::Unreachable {
+            url: url.clone(),
+            source: e,
+        })?;
+        if !resp.status().is_success() {
+            return Err(match resp.status() {
+                reqwest::StatusCode::UNAUTHORIZED => ClientError::Unauthorized,
+                s => ClientError::Server {
+                    status: s.as_u16(),
+                    body: String::new(),
+                },
+            });
+        }
+        let byte_stream = resp
+            .bytes_stream()
+            .map(|r| r.map_err(std::io::Error::other));
+        let event_stream = byte_stream.eventsource();
+        Ok(event_stream.map(|r| match r {
+            Ok(ev) => serde_json::from_str::<crate::admin::types::RequestEvent>(&ev.data)
+                .map_err(|e| ClientError::Decode {
+                    reason: e.to_string(),
+                }),
+            Err(e) => Err(ClientError::Stream {
+                reason: e.to_string(),
+            }),
+        }))
+    }
+
     pub async fn effective_config(&self) -> Result<serde_json::Value, ClientError> {
         self.get("/v1/admin/config").await
     }
@@ -151,5 +198,74 @@ impl FlarionClient {
     pub async fn pin_model(&self, id: &str, pinned: bool) -> Result<(), ClientError> {
         let action = if pinned { "pin" } else { "unpin" };
         self.post_empty(&format!("/v1/admin/models/{id}/{action}")).await
+    }
+
+    pub async fn chat_stream(
+        &self,
+        mut req: crate::api::types::ChatCompletionRequest,
+    ) -> Result<
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<crate::api::types::ChatCompletionChunk, ClientError>> + Send>>,
+        ClientError,
+    > {
+        use eventsource_stream::Eventsource;
+        use futures_util::StreamExt;
+
+        req.stream = true;
+        let url = format!("{}/v1/chat/completions", self.endpoint.url.trim_end_matches('/'));
+        let mut r = self.http.post(&url)
+            .timeout(std::time::Duration::from_secs(60 * 60))
+            .json(&req);
+        if let Some(k) = &self.endpoint.api_key { r = r.bearer_auth(k); }
+        let resp = r.send().await.map_err(|e| ClientError::Unreachable {
+            url: url.clone(), source: e,
+        })?;
+        if !resp.status().is_success() {
+            return Err(match resp.status() {
+                reqwest::StatusCode::UNAUTHORIZED => ClientError::Unauthorized,
+                reqwest::StatusCode::NOT_FOUND => ClientError::NotFound { resource: "model".into() },
+                s => ClientError::Server {
+                    status: s.as_u16(),
+                    body: resp.text().await.unwrap_or_default(),
+                },
+            });
+        }
+        let byte_stream = resp.bytes_stream().map(|r| r.map_err(std::io::Error::other));
+        let event_stream = byte_stream.eventsource();
+        let stream = event_stream.filter_map(|r| async move {
+            match r {
+                Ok(ev) if ev.data == "[DONE]" => None,
+                Ok(ev) => match serde_json::from_str::<crate::api::types::ChatCompletionChunk>(&ev.data) {
+                    Ok(chunk) => Some(Ok(chunk)),
+                    Err(e) => Some(Err(ClientError::Decode { reason: e.to_string() })),
+                },
+                Err(e) => Some(Err(ClientError::Stream { reason: e.to_string() })),
+            }
+        });
+        Ok(Box::pin(stream))
+    }
+
+    pub async fn chat_nonstream(
+        &self,
+        req: crate::api::types::ChatCompletionRequest,
+    ) -> Result<crate::api::types::ChatCompletionResponse, ClientError> {
+        let url = format!("{}/v1/chat/completions", self.endpoint.url.trim_end_matches('/'));
+        let mut r = self.http.post(&url)
+            .timeout(std::time::Duration::from_secs(120))
+            .json(&req);
+        if let Some(k) = &self.endpoint.api_key { r = r.bearer_auth(k); }
+        let resp = r.send().await.map_err(|e| {
+            if e.is_timeout() { ClientError::Timeout }
+            else { ClientError::Unreachable { url: url.clone(), source: e } }
+        })?;
+        match resp.status() {
+            s if s.is_success() => resp.json::<crate::api::types::ChatCompletionResponse>().await
+                .map_err(|e| ClientError::Decode { reason: e.to_string() }),
+            StatusCode::UNAUTHORIZED => Err(ClientError::Unauthorized),
+            StatusCode::NOT_FOUND => Err(ClientError::NotFound { resource: "model".into() }),
+            status => Err(ClientError::Server {
+                status: status.as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            }),
+        }
     }
 }

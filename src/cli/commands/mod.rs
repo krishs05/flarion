@@ -1,10 +1,19 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+pub mod chat;
+pub mod completions;
+pub mod config;
 pub mod endpoints;
+pub mod gpu;
+pub mod health;
 pub mod login;
+pub mod models;
+pub mod requests;
+pub mod routes;
 pub mod serve;
 pub mod status;
+pub mod version;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,21 +42,48 @@ pub struct FlarionCli {
 pub enum Command {
     /// Run the Flarion inference gateway server.
     Serve(crate::config::Cli),
+    /// Send a chat completion or start an interactive REPL.
+    Chat(crate::cli::commands::chat::ChatArgs),
+    /// Generate shell completion scripts.
+    Completions(crate::cli::commands::completions::CompletionsArgs),
+    /// Show GPU status.
+    Gpu(crate::cli::commands::gpu::GpuArgs),
+    /// Liveness check — hits /health.
+    Health(crate::cli::commands::health::HealthArgs),
     /// Inspect a running Flarion server.
     Status(crate::cli::commands::status::StatusArgs),
+    /// Manage models (list, show, load, unload, pin, unpin).
+    Models(crate::cli::commands::models::ModelsArgs),
+    /// Tail the server's request log (optionally --follow via SSE).
+    Requests(crate::cli::commands::requests::RequestsArgs),
+    /// Inspect configured routes.
+    Routes(crate::cli::commands::routes::RoutesArgs),
     /// Manage named endpoints in the client config.
     Endpoints(crate::cli::commands::endpoints::EndpointsArgs),
+    /// Inspect or validate Flarion configuration.
+    Config(crate::cli::commands::config::ConfigArgs),
     /// Interactive first-run wizard to add an endpoint.
     Login { name: String },
+    /// Print version info for the client + any reachable server.
+    Version(crate::cli::commands::version::VersionArgs),
 }
 
 pub async fn dispatch() -> anyhow::Result<()> {
     let parsed = FlarionCli::parse();
     match parsed.command {
         Some(Command::Serve(args)) => serve::run(args).await,
+        Some(Command::Chat(args)) => chat::run(args).await,
+        Some(Command::Completions(args)) => completions::run(args).await,
+        Some(Command::Gpu(args)) => gpu::run(args).await,
+        Some(Command::Health(args)) => health::run(args).await,
         Some(Command::Status(args)) => status::run(args).await,
+        Some(Command::Models(args)) => models::run(args).await,
+        Some(Command::Requests(args)) => requests::run(args).await,
+        Some(Command::Routes(args)) => routes::run(args).await,
         Some(Command::Endpoints(args)) => endpoints::run(args).await,
+        Some(Command::Config(args)) => config::run(args).await,
         Some(Command::Login { name }) => login::run(name).await,
+        Some(Command::Version(args)) => version::run(args).await,
         None => {
             // Compat: `flarion -c foo.toml` with no subcommand → act like serve.
             if parsed.legacy_config.is_some() {

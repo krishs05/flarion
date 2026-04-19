@@ -1,6 +1,6 @@
 [package]
 name = "flarion"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 license = "MIT"
 description = "A Rust-native LLM inference gateway"
@@ -35,12 +35,25 @@ url = "2"
 nvml-wrapper = "0.10"
 dashmap = "6"
 dirs = "5"
+rustyline = "14"
+resvg = "0.47.0"
+tiny-skia = "0.12.0"
+fontdb = "0.23.0"
+clap_complete = "4.6.2"
 
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 wiremock = "0.6"
+
+[[bin]]
+name = "flarion"
+path = "src/main.rs"
+
+[[bin]]
+name = "generate-ascii-fallback"
+path = "scripts/generate-ascii-fallback.rs"
 
 [features]
 default = []
