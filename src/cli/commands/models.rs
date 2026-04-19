@@ -281,7 +281,7 @@ mod tests {
 
     #[test]
     fn show_find_by_id_succeeds() {
-        let models = vec![
+        let models = [
             make_model("llama-3", "loaded", false, false),
             make_model("mistral", "unloaded", false, false),
         ];
@@ -292,7 +292,7 @@ mod tests {
 
     #[test]
     fn show_find_by_id_missing_returns_none() {
-        let models = vec![make_model("llama-3", "loaded", false, false)];
+        let models = [make_model("llama-3", "loaded", false, false)];
         let found = models.iter().find(|m| m.id == "does-not-exist");
         assert!(found.is_none());
     }

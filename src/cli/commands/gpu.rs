@@ -38,9 +38,11 @@ pub async fn run(args: GpuArgs) -> anyhow::Result<()> {
         None => gpus,
     };
 
-    if args.id.is_some() && filtered.is_empty() {
-        eprintln!("flarion: no such GPU (id={})", args.id.unwrap());
-        std::process::exit(4);
+    if let Some(id) = args.id {
+        if filtered.is_empty() {
+            eprintln!("flarion: no such GPU (id={id})");
+            std::process::exit(4);
+        }
     }
 
     if args.json {
