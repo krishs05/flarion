@@ -199,4 +199,29 @@ impl FlarionClient {
         let action = if pinned { "pin" } else { "unpin" };
         self.post_empty(&format!("/v1/admin/models/{id}/{action}")).await
     }
+
+    pub async fn chat_nonstream(
+        &self,
+        req: crate::api::types::ChatCompletionRequest,
+    ) -> Result<crate::api::types::ChatCompletionResponse, ClientError> {
+        let url = format!("{}/v1/chat/completions", self.endpoint.url.trim_end_matches('/'));
+        let mut r = self.http.post(&url)
+            .timeout(std::time::Duration::from_secs(120))
+            .json(&req);
+        if let Some(k) = &self.endpoint.api_key { r = r.bearer_auth(k); }
+        let resp = r.send().await.map_err(|e| {
+            if e.is_timeout() { ClientError::Timeout }
+            else { ClientError::Unreachable { url: url.clone(), source: e } }
+        })?;
+        match resp.status() {
+            s if s.is_success() => resp.json::<crate::api::types::ChatCompletionResponse>().await
+                .map_err(|e| ClientError::Decode { reason: e.to_string() }),
+            StatusCode::UNAUTHORIZED => Err(ClientError::Unauthorized),
+            StatusCode::NOT_FOUND => Err(ClientError::NotFound { resource: "model".into() }),
+            status => Err(ClientError::Server {
+                status: status.as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            }),
+        }
+    }
 }
