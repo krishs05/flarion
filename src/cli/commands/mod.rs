@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+pub mod config;
 pub mod endpoints;
 pub mod gpu;
 pub mod health;
@@ -53,6 +54,8 @@ pub enum Command {
     Routes(crate::cli::commands::routes::RoutesArgs),
     /// Manage named endpoints in the client config.
     Endpoints(crate::cli::commands::endpoints::EndpointsArgs),
+    /// Inspect or validate Flarion configuration.
+    Config(crate::cli::commands::config::ConfigArgs),
     /// Interactive first-run wizard to add an endpoint.
     Login { name: String },
     /// Print version info for the client + any reachable server.
@@ -70,6 +73,7 @@ pub async fn dispatch() -> anyhow::Result<()> {
         Some(Command::Requests(args)) => requests::run(args).await,
         Some(Command::Routes(args)) => routes::run(args).await,
         Some(Command::Endpoints(args)) => endpoints::run(args).await,
+        Some(Command::Config(args)) => config::run(args).await,
         Some(Command::Login { name }) => login::run(name).await,
         Some(Command::Version(args)) => version::run(args).await,
         None => {
