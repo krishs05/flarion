@@ -46,6 +46,9 @@ pub async fn run(args: VersionArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let mode = crate::cli::branding::detect_mode();
+    let mark = crate::cli::branding::render_mark(16, mode);
+    print!("{mark}");
     println!("▲ FLARION {client_version}");
     println!(
         "  client  {}  ({})",
