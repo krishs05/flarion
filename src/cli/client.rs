@@ -200,6 +200,50 @@ impl FlarionClient {
         self.post_empty(&format!("/v1/admin/models/{id}/{action}")).await
     }
 
+    pub async fn chat_stream(
+        &self,
+        mut req: crate::api::types::ChatCompletionRequest,
+    ) -> Result<
+        std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<crate::api::types::ChatCompletionChunk, ClientError>> + Send>>,
+        ClientError,
+    > {
+        use eventsource_stream::Eventsource;
+        use futures_util::StreamExt;
+
+        req.stream = true;
+        let url = format!("{}/v1/chat/completions", self.endpoint.url.trim_end_matches('/'));
+        let mut r = self.http.post(&url)
+            .timeout(std::time::Duration::from_secs(60 * 60))
+            .json(&req);
+        if let Some(k) = &self.endpoint.api_key { r = r.bearer_auth(k); }
+        let resp = r.send().await.map_err(|e| ClientError::Unreachable {
+            url: url.clone(), source: e,
+        })?;
+        if !resp.status().is_success() {
+            return Err(match resp.status() {
+                reqwest::StatusCode::UNAUTHORIZED => ClientError::Unauthorized,
+                reqwest::StatusCode::NOT_FOUND => ClientError::NotFound { resource: "model".into() },
+                s => ClientError::Server {
+                    status: s.as_u16(),
+                    body: resp.text().await.unwrap_or_default(),
+                },
+            });
+        }
+        let byte_stream = resp.bytes_stream().map(|r| r.map_err(std::io::Error::other));
+        let event_stream = byte_stream.eventsource();
+        let stream = event_stream.filter_map(|r| async move {
+            match r {
+                Ok(ev) if ev.data == "[DONE]" => None,
+                Ok(ev) => match serde_json::from_str::<crate::api::types::ChatCompletionChunk>(&ev.data) {
+                    Ok(chunk) => Some(Ok(chunk)),
+                    Err(e) => Some(Err(ClientError::Decode { reason: e.to_string() })),
+                },
+                Err(e) => Some(Err(ClientError::Stream { reason: e.to_string() })),
+            }
+        });
+        Ok(Box::pin(stream))
+    }
+
     pub async fn chat_nonstream(
         &self,
         req: crate::api::types::ChatCompletionRequest,

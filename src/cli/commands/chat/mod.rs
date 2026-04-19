@@ -1,3 +1,6 @@
+pub mod repl;
+pub mod stream;
+
 use clap::Args;
 use std::path::PathBuf;
 
@@ -18,9 +21,17 @@ pub struct ChatArgs {
     #[arg(long, default_value = "512")]
     pub max_tokens: u32,
 
-    /// Start an interactive REPL (implemented in Task 12).
+    /// Start an interactive REPL.
     #[arg(long)]
     pub repl: bool,
+
+    /// Force streaming output (default when stdout is a TTY).
+    #[arg(long, conflicts_with = "no_stream")]
+    pub stream: bool,
+
+    /// Force non-streaming output (useful when piping to another tool).
+    #[arg(long, conflicts_with = "stream")]
+    pub no_stream: bool,
 
     #[arg(long)] pub url: Option<String>,
     #[arg(long)] pub api_key: Option<String>,
@@ -37,7 +48,7 @@ impl crate::cli::resolve::EndpointArgs for ChatArgs {
 
 pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
     if args.repl {
-        anyhow::bail!("--repl not yet implemented (lands in Task 12)");
+        return repl::run(args).await;
     }
 
     let prompt = match args.prompt.as_deref() {
@@ -49,7 +60,7 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
         }
         Some(p) => p.to_string(),
         None => {
-            eprintln!("flarion: no prompt provided (positional arg or '-' for stdin required; use --repl for interactive mode once available)");
+            eprintln!("flarion: no prompt provided (positional arg or '-' for stdin required; use --repl for interactive mode)");
             std::process::exit(2);
         }
     };
@@ -77,10 +88,18 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
         content: prompt,
     });
 
+    let use_streaming = if args.stream {
+        true
+    } else if args.no_stream {
+        false
+    } else {
+        std::io::IsTerminal::is_terminal(&std::io::stdout())
+    };
+
     let req = crate::api::types::ChatCompletionRequest {
         model,
         messages,
-        stream: false,
+        stream: false, // set correctly inside chat_stream / chat_nonstream
         temperature: 0.7,
         top_p: 0.9,
         max_tokens: args.max_tokens,
@@ -88,23 +107,26 @@ pub async fn run(args: ChatArgs) -> anyhow::Result<()> {
         seed: None,
     };
 
-    let resp = match client.chat_nonstream(req).await {
-        Ok(r) => r,
-        Err(crate::cli::error::ClientError::Unreachable { url, .. }) => {
-            eprintln!("flarion: can't reach {url}"); std::process::exit(3);
+    if use_streaming {
+        stream::run_streaming_oneshot(&client, req).await?;
+    } else {
+        let resp = match client.chat_nonstream(req).await {
+            Ok(r) => r,
+            Err(crate::cli::error::ClientError::Unreachable { url, .. }) => {
+                eprintln!("flarion: can't reach {url}"); std::process::exit(3);
+            }
+            Err(crate::cli::error::ClientError::Unauthorized) => {
+                eprintln!("flarion: unauthorized"); std::process::exit(2);
+            }
+            Err(crate::cli::error::ClientError::NotFound { .. }) => {
+                eprintln!("flarion: model not found"); std::process::exit(4);
+            }
+            Err(e) => { eprintln!("flarion: {e}"); std::process::exit(1); }
+        };
+        for choice in &resp.choices {
+            print!("{}", choice.message.content);
         }
-        Err(crate::cli::error::ClientError::Unauthorized) => {
-            eprintln!("flarion: unauthorized"); std::process::exit(2);
-        }
-        Err(crate::cli::error::ClientError::NotFound { .. }) => {
-            eprintln!("flarion: model not found"); std::process::exit(4);
-        }
-        Err(e) => { eprintln!("flarion: {e}"); std::process::exit(1); }
-    };
-
-    for choice in &resp.choices {
-        print!("{}", choice.message.content);
+        println!();
     }
-    println!();
     Ok(())
 }
