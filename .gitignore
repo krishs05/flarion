@@ -27,6 +27,9 @@ Thumbs.db
 # Local developer configs (contain host-specific paths)
 /my-config.toml
 
+# Local model weights (host-specific, too large to version)
+/models/
+
 # Frontend build artifacts
 /ui/node_modules
 /ui/build
