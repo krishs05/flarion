@@ -5,6 +5,7 @@ pub mod endpoints;
 pub mod login;
 pub mod serve;
 pub mod status;
+pub mod version;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -39,6 +40,8 @@ pub enum Command {
     Endpoints(crate::cli::commands::endpoints::EndpointsArgs),
     /// Interactive first-run wizard to add an endpoint.
     Login { name: String },
+    /// Print version info for the client + any reachable server.
+    Version(crate::cli::commands::version::VersionArgs),
 }
 
 pub async fn dispatch() -> anyhow::Result<()> {
@@ -48,6 +51,7 @@ pub async fn dispatch() -> anyhow::Result<()> {
         Some(Command::Status(args)) => status::run(args).await,
         Some(Command::Endpoints(args)) => endpoints::run(args).await,
         Some(Command::Login { name }) => login::run(name).await,
+        Some(Command::Version(args)) => version::run(args).await,
         None => {
             // Compat: `flarion -c foo.toml` with no subcommand → act like serve.
             if parsed.legacy_config.is_some() {
